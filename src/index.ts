@@ -11,7 +11,17 @@ if (!admin.apps.length) {
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
 // API keys for server-to-server communication (store in Firebase Secret Manager in production)
-const VALID_API_KEYS = process.env.VALID_API_KEYS?.split(',') || [];
+function getValidApiKeys(): string[] {
+  try {
+    const functionsConfig = functions.config();
+    return functionsConfig.security?.api_keys?.split(',') || process.env.VALID_API_KEYS?.split(',') || [];
+  } catch (error) {
+    console.warn('Failed to get API keys from Firebase config, falling back to environment variable');
+    return process.env.VALID_API_KEYS?.split(',') || [];
+  }
+}
+
+const VALID_API_KEYS = getValidApiKeys();
 
 interface AuthenticatedRequest extends functions.https.Request {
   user?: admin.auth.DecodedIdToken;
@@ -21,16 +31,16 @@ interface AuthenticatedRequest extends functions.https.Request {
 function checkRateLimit(identifier: string, limit: number = 10, windowMs: number = 60000): boolean {
   const now = Date.now();
   const record = rateLimitStore.get(identifier);
-  
+
   if (!record || now > record.resetTime) {
     rateLimitStore.set(identifier, { count: 1, resetTime: now + windowMs });
     return true;
   }
-  
+
   if (record.count >= limit) {
     return false;
   }
-  
+
   record.count++;
   return true;
 }
@@ -40,7 +50,7 @@ async function authenticateRequest(request: AuthenticatedRequest): Promise<{ aut
   try {
     // Check for API key first (for server-to-server communication)
     const apiKey = request.headers['x-api-key'] || request.headers['authorization']?.replace('Bearer ', '');
-    if (apiKey && VALID_API_KEYS.includes(apiKey)) {
+    if (apiKey && typeof apiKey === 'string' && VALID_API_KEYS.includes(apiKey)) {
       return { authenticated: true };
     }
 
@@ -52,7 +62,7 @@ async function authenticateRequest(request: AuthenticatedRequest): Promise<{ aut
 
     const token = authHeader.split('Bearer ')[1];
     const decodedToken = await admin.auth().verifyIdToken(token);
-    
+
     // Optional: Check if user has specific claims or is in allowed list
     // const allowedUsers = process.env.ALLOWED_USER_IDS?.split(',') || [];
     // if (allowedUsers.length > 0 && !allowedUsers.includes(decodedToken.uid)) {
@@ -101,7 +111,10 @@ export const getAppleMusicToken = functions.https.onRequest(async (request: Auth
     }
 
     // Rate limiting
-    const identifier = authResult.user?.uid || request.headers['x-forwarded-for'] || request.ip || 'unknown';
+    const identifier = authResult.user?.uid ||
+      (typeof request.headers['x-forwarded-for'] === 'string' ? request.headers['x-forwarded-for'] : '') ||
+      request.ip ||
+      'unknown';
     if (!checkRateLimit(identifier, 10, 60000)) { // 10 requests per minute
       response.status(429).json({
         success: false,
@@ -155,7 +168,7 @@ export const authStatus = functions.https.onRequest(async (request: Authenticate
     }
 
     const authResult = await authenticateRequest(request);
-    
+
     response.status(200).json({
       success: true,
       authenticated: authResult.authenticated,
