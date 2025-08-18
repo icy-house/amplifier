@@ -187,3 +187,6 @@ export const authStatus = functions.https.onRequest(async (request: Authenticate
     });
   }
 });
+
+// Export the API key distribution function
+export { getApiKey } from './api-key-distribution';

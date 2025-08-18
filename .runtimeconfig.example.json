@@ -1,0 +1,10 @@
+{
+  "apple": {
+    "key_id": "YOUR_APPLE_KEY_ID",
+    "issuer": "YOUR_APPLE_ISSUER_ID",
+    "team_id": "YOUR_APPLE_TEAM_ID"
+  },
+  "security": {
+    "api_keys": "your-api-key-1,your-api-key-2"
+  }
+}
