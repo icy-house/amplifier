@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AmpleMusic - Authentication Successful</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: white;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            text-align: center;
+            max-width: 400px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+        .success-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+        h1 {
+            margin: 0 0 20px 0;
+            font-size: 28px;
+            font-weight: 600;
+        }
+        p {
+            margin: 0 0 30px 0;
+            font-size: 16px;
+            line-height: 1.5;
+            opacity: 0.9;
+        }
+        .close-button {
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 25px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .close-button:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+        .status {
+            margin-top: 20px;
+            font-size: 14px;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">✅</div>
+        <h1>Welcome to AmpleMusic!</h1>
+        <p>You have been successfully signed in with Apple. You can now close this page and return to your car's AmpleMusic app.</p>
+        <button class="close-button" onclick="closeWindow()">Close Page</button>
+        <div class="status" id="status">Authentication successful</div>
+    </div>
+
+    <script>
+        // Function to close the window/tab
+        function closeWindow() {
+            window.close();
+            // Fallback for mobile browsers that don't allow window.close()
+            if (!window.closed) {
+                // Try to go back
+                if (window.history.length > 1) {
+                    window.history.back();
+                } else {
+                    // Show a message to manually close
+                    document.getElementById('status').textContent = 'Please manually close this tab';
+                }
+            }
+        }
+
+        // Auto-close after 5 seconds
+        setTimeout(function() {
+            document.getElementById('status').textContent = 'This page will close automatically...';
+            setTimeout(closeWindow, 2000);
+        }, 5000);
+
+        // Listen for visibility change to detect when user switches tabs
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                // User switched away from this tab, which is good
+                console.log('User switched away from auth success page');
+            }
+        });
+
+        // Log successful authentication
+        console.log('AmpleMusic authentication successful');
+    </script>
+</body>
+</html>
