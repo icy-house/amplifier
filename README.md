@@ -230,7 +230,7 @@ while (true) {
 - Authenticated car polling (`X-Poll-Secret`) with single-use token handoff (+ short redelivery window)
 - Firestore `auth_sessions`: deny-all for client SDKs (Admin SDK / Functions only)
 - Firebase Authentication on the phone auth path
-- MusicKit user token from a real phone `authorize()` step; developer JWTs are short-lived (1h web / 24h car handoff) and never long-lived 6-month tokens in the session channel
+- MusicKit user token verified server-side against Apple Music (`/v1/me/storefront`) before the car can poll it; developer JWTs are short-lived (1h web / 24h car handoff) and never long-lived 6-month tokens in the session channel
 - Web developer JWTs include an `origin` claim limited to Amplifier hosting origins
 - Secrets in Secret Manager (not the repo)
 - Rate limiting (durable abuse controls still tracked separately)

@@ -202,6 +202,36 @@ async function verifyFirebaseToken(
 }
 
 /**
+ * Prove the Music User Token works with Apple Music before storing it for the car.
+ */
+async function verifyMusicUserTokenWithApple(
+  developerToken: string,
+  musicUserToken: string
+): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const response = await fetch('https://api.music.apple.com/v1/me/storefront', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${developerToken}`,
+        'Music-User-Token': musicUserToken,
+      },
+    });
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    console.error(
+      `Apple Music Music User Token probe failed: HTTP ${response.status}`
+    );
+    return { valid: false, error: 'Invalid Apple Music user token' };
+  } catch (error) {
+    console.error('Apple Music Music User Token probe error:', error);
+    return { valid: false, error: 'Unable to verify Apple Music user token' };
+  }
+}
+
+/**
  * Car creates a session. Returns server-generated sessionId + pollSecret.
  * QR must encode sessionId only; pollSecret stays on the car.
  */
@@ -518,6 +548,15 @@ export const completeAuthentication = onRequest(
         expiresInSeconds: HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
       });
 
+      const tokenProbe = await verifyMusicUserTokenWithApple(developerToken, musicUserToken);
+      if (!tokenProbe.valid) {
+        response.status(400).json({
+          success: false,
+          error: tokenProbe.error || 'Invalid Apple Music user token',
+        });
+        return;
+      }
+
       try {
         await admin.firestore().runTransaction(async (tx) => {
           const sessionDoc = await tx.get(sessionRef);
@@ -713,7 +752,12 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
         }
 
-        if (isExpired(sessionData.expiresAt)) {
+        const withinRedeliveryWindow =
+          sessionData.status === 'consumed' &&
+          isWithinRedeliveryWindow(sessionData.tokensDeliveredAt);
+
+        // Expiry must not clobber an active redelivery window (lost first poll response).
+        if (isExpired(sessionData.expiresAt) && !withinRedeliveryWindow) {
           if (sessionHasHandoffTokens(sessionData)) {
             tx.update(sessionRef, {
               ...tokenFieldDeletes(),
@@ -727,16 +771,15 @@ export const getSessionStatus = onRequest(async (request, response) => {
 
         const canDeliverToken =
           sessionHasHandoffTokens(sessionData) &&
-          (sessionData.status === 'success' ||
-            (sessionData.status === 'consumed' &&
-              isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)));
+          (sessionData.status === 'success' || withinRedeliveryWindow);
 
         if (canDeliverToken) {
           if (!sessionData.tokensDeliveredAt) {
-            // First successful handoff: mark delivered but keep tokens briefly for retries.
+            // First successful handoff: mark delivered, extend TTL through the retry window.
             tx.update(sessionRef, {
               status: 'consumed',
               tokensDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+              expiresAt: new Date(Date.now() + TOKEN_REDELIVERY_WINDOW_MS),
             });
           }
 
@@ -759,7 +802,7 @@ export const getSessionStatus = onRequest(async (request, response) => {
         if (
           sessionData.status === 'consumed' &&
           sessionHasHandoffTokens(sessionData) &&
-          !isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)
+          !withinRedeliveryWindow
         ) {
           tx.update(sessionRef, {
             ...tokenFieldDeletes(),

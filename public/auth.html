@@ -259,8 +259,12 @@
                 const music = await ensureMusicKitConfigured();
 
                 updateStatus('Authorize Apple Music in the dialog…', 'pending', true);
-                const musicUserToken = await music.authorize();
-                if (!musicUserToken || typeof musicUserToken !== 'string') {
+                const authorizeResult = await music.authorize();
+                const musicUserToken =
+                    (typeof authorizeResult === 'string' && authorizeResult.trim())
+                        ? authorizeResult.trim()
+                        : (typeof music.musicUserToken === 'string' ? music.musicUserToken.trim() : '');
+                if (!musicUserToken) {
                     throw new Error('Apple Music authorization did not return a user token');
                 }
 
