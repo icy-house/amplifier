@@ -58,7 +58,7 @@ sequenceDiagram
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 24 (Cloud Functions 2nd gen runtime; keep local Node aligned)
 - Firebase CLI
 - Apple Developer Account with Music API access
 - Firebase project with Authentication enabled
@@ -86,16 +86,21 @@ firebase init functions
 
 ### 3. Environment Setup
 
-```bash
-# Copy environment template
-cp env.example .env
+Params and secrets replace the old `functions.config()` / `.runtimeconfig.json` flow.
 
-# Set Apple Music credentials
-firebase functions:config:set apple.key_id="YOUR_KEY_ID"
-firebase functions:config:set apple.team_id="YOUR_TEAM_ID"
-firebase functions:config:set apple.issuer="YOUR_ISSUER_ID"
-firebase functions:config:set apple.private_key_path="/path/to/AuthKey_KEYID.p8"
+```bash
+# Non-secret params (written to .env.<projectId> on first deploy, or set ahead of time)
+cat >> .env.amplifier-backend <<'EOF'
+APPLE_MUSIC_KEY_ID=YOUR_KEY_ID
+APPLE_MUSIC_TEAM_ID=YOUR_TEAM_ID
+APPLE_MUSIC_ISSUER=YOUR_ISSUER_ID
+EOF
+
+# Private key in Secret Manager (paste .p8 contents when prompted)
+firebase functions:secrets:set APPLE_MUSIC_PRIVATE_KEY
 ```
+
+For the emulator, put the same non-secret params in `.env` / `.env.local`, and the private key in `.secret.local` as `APPLE_MUSIC_PRIVATE_KEY=...` (never commit these files).
 
 ### 4. Deploy
 
@@ -104,6 +109,8 @@ npm install
 npm run build
 npm run deploy
 ```
+
+Runtime is **Node.js 24** (`engines.node` and `firebase.json` `runtime: nodejs24`). Functions are **2nd gen**.
 
 ## API Endpoints
 
