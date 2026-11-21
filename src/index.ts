@@ -188,6 +188,28 @@ function isWithinRedeliveryWindow(tokensDeliveredAt: AuthSession['tokensDelivere
   return Date.now() - deliveredAt <= TOKEN_REDELIVERY_WINDOW_MS;
 }
 
+/** Phone-flow expiry capped by session creation so re-init cannot extend forever. */
+function phoneFlowExpiresAt(createdAt: AuthSession['createdAt']): Date {
+  const createdMs = toMillis(createdAt) ?? Date.now();
+  const absoluteMax = createdMs + SESSION_PHONE_TTL_MS;
+  return new Date(Math.min(Date.now() + SESSION_PHONE_TTL_MS, absoluteMax));
+}
+
+function assertPhoneBoundPendingSession(
+  sessionData: AuthSession,
+  uid: string
+): void {
+  if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== uid) {
+    throw Object.assign(new Error('Session does not belong to this user'), { code: 403 });
+  }
+  if (isExpired(sessionData.expiresAt)) {
+    throw Object.assign(new Error('Session has expired'), { code: 410 });
+  }
+  if (sessionData.status !== 'pending') {
+    throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
+  }
+}
+
 async function verifyFirebaseToken(
   idToken: string
 ): Promise<{
@@ -210,7 +232,7 @@ async function verifyFirebaseToken(
 async function verifyMusicUserTokenWithApple(
   developerToken: string,
   musicUserToken: string
-): Promise<{ valid: boolean; error?: string }> {
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -224,16 +246,27 @@ async function verifyMusicUserTokenWithApple(
     });
 
     if (response.ok) {
-      return { valid: true };
+      return { ok: true };
     }
 
     console.error(
       `Apple Music Music User Token probe failed: HTTP ${response.status}`
     );
-    return { valid: false, error: 'Invalid Apple Music user token' };
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, status: 400, error: 'Invalid Apple Music user token' };
+    }
+    return {
+      ok: false,
+      status: 502,
+      error: 'Apple Music verification temporarily unavailable',
+    };
   } catch (error) {
     console.error('Apple Music Music User Token probe error:', error);
-    return { valid: false, error: 'Unable to verify Apple Music user token' };
+    return {
+      ok: false,
+      status: 502,
+      error: 'Unable to verify Apple Music user token',
+    };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -377,9 +410,8 @@ export const initializeSession = onRequest(async (request, response) => {
         }
 
         if (sessionData.firebaseUserId === user.uid) {
-          // Refresh phone-flow TTL so SIWA redirect + MusicKit authorize still fit.
           tx.update(sessionRef, {
-            expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
+            expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
           });
           return;
         }
@@ -388,7 +420,7 @@ export const initializeSession = onRequest(async (request, response) => {
           firebaseUserId: user.uid,
           userEmail: user.email ?? null,
           authProvider: user.firebase?.sign_in_provider || 'unknown',
-          expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
+          expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
         });
       });
     } catch (error) {
@@ -443,11 +475,19 @@ export const getMusicKitDeveloperToken = onRequest(
         return;
       }
 
+      const sessionIdRaw =
+        typeof request.query?.sessionId === 'string'
+          ? request.query.sessionId
+          : typeof request.body?.sessionId === 'string'
+            ? request.body.sessionId
+            : '';
+      const sessionId = sessionIdRaw.trim();
       const firebaseIdToken = getFirebaseIdToken(request);
-      if (!firebaseIdToken) {
-        response.status(401).json({
+
+      if (!sessionId || !firebaseIdToken) {
+        response.status(400).json({
           success: false,
-          error: 'Missing firebase authentication',
+          error: 'Missing sessionId or firebase authentication',
         });
         return;
       }
@@ -467,6 +507,33 @@ export const getMusicKitDeveloperToken = onRequest(
           error: 'Rate limit exceeded. Please try again later.',
         });
         return;
+      }
+
+      const sessionDoc = await admin
+        .firestore()
+        .collection(AUTH_SESSIONS)
+        .doc(sessionId)
+        .get();
+      if (!sessionDoc.exists) {
+        response.status(404).json({
+          success: false,
+          error: 'Session not found',
+        });
+        return;
+      }
+
+      try {
+        assertPhoneBoundPendingSession(sessionDoc.data() as AuthSession, authResult.user.uid);
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
       }
 
       const developerToken = generateDeveloperToken({
@@ -556,16 +623,39 @@ export const completeAuthentication = onRequest(
       const user = authResult.user;
       const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
+      // Ownership check before calling Apple (avoids using this endpoint as a MUT oracle).
+      const precheck = await sessionRef.get();
+      if (!precheck.exists) {
+        response.status(404).json({
+          success: false,
+          error: 'Session not found',
+        });
+        return;
+      }
+      try {
+        assertPhoneBoundPendingSession(precheck.data() as AuthSession, user.uid);
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
+      }
+
       // Fresh short-lived developer JWT for the car (no web origin claim).
       const developerToken = generateDeveloperToken({
         expiresInSeconds: HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
       });
 
       const tokenProbe = await verifyMusicUserTokenWithApple(developerToken, musicUserToken);
-      if (!tokenProbe.valid) {
-        response.status(400).json({
+      if (!tokenProbe.ok) {
+        response.status(tokenProbe.status).json({
           success: false,
-          error: tokenProbe.error || 'Invalid Apple Music user token',
+          error: tokenProbe.error,
         });
         return;
       }
@@ -577,21 +667,7 @@ export const completeAuthentication = onRequest(
             throw Object.assign(new Error('Session not found'), { code: 404 });
           }
 
-          const sessionData = sessionDoc.data() as AuthSession;
-
-          if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== user.uid) {
-            throw Object.assign(new Error('Session does not belong to this user'), {
-              code: 403,
-            });
-          }
-
-          if (isExpired(sessionData.expiresAt)) {
-            throw Object.assign(new Error('Session has expired'), { code: 410 });
-          }
-
-          if (sessionData.status !== 'pending') {
-            throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
-          }
+          assertPhoneBoundPendingSession(sessionDoc.data() as AuthSession, user.uid);
 
           tx.update(sessionRef, {
             status: 'success',
@@ -723,8 +799,6 @@ export const getSessionStatus = onRequest(async (request, response) => {
       expiresAt?: AuthSession['expiresAt'];
       musicUserToken?: string;
       developerToken?: string;
-      /** @deprecated Alias of musicUserToken for older car clients. */
-      userAccessToken?: string;
       error?: string;
     };
 
@@ -783,7 +857,6 @@ export const getSessionStatus = onRequest(async (request, response) => {
             expiresAt: sessionData.expiresAt,
             musicUserToken,
             developerToken,
-            userAccessToken: musicUserToken,
           };
         }
 

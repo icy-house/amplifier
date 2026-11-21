@@ -147,9 +147,11 @@ Phone binds Sign in with Apple (Firebase Auth) to an existing session. Does not 
 ```
 
 ### GET|POST /getMusicKitDeveloperToken
-Phone (after Sign in with Apple) fetches a short-lived MusicKit developer JWT for MusicKit JS `configure()` / `authorize()`. JWT includes a web `origin` claim for Amplifier hosting origins. Not returned to the car.
+Phone (after Sign in with Apple + `initializeSession`) fetches a short-lived MusicKit developer JWT for MusicKit JS `configure()` / `authorize()`. Requires a pending session bound to the caller. JWT includes a web `origin` claim for Amplifier hosting origins. Not returned to the car.
 
 **Headers:** `Authorization: Bearer <firebaseIdToken>`
+
+**Query/body:** `sessionId`
 
 **Response:**
 ```json
@@ -184,10 +186,11 @@ Car polls session status. Requires `X-Poll-Secret`. On success, the token pair i
   "success": true,
   "status": "success|pending|error|consumed",
   "musicUserToken": "present during first handoff + short redelivery window",
-  "developerToken": "short-lived MusicKit developer JWT (24h) for Apple Music API Authorization header",
-  "userAccessToken": "deprecated alias of musicUserToken"
+  "developerToken": "short-lived MusicKit developer JWT (24h) for Apple Music API Authorization header"
 }
 ```
+
+**Breaking change for AmpleMusic:** the old `userAccessToken` field is removed. It previously carried a placeholder developer JWT; the car must now use `musicUserToken` + `developerToken`.
 
 Apple Music user-scoped API calls need both headers: `Authorization: Bearer <developerToken>` and `Music-User-Token: <musicUserToken>`.
 
@@ -211,7 +214,6 @@ while (true) {
     when (status.status) {
         "success" -> {
             val musicUserToken = status.musicUserToken
-                ?: status.userAccessToken // transitional alias
                 ?: error("success without music user token; start a new session")
             val developerToken = status.developerToken
                 ?: error("success without developer token; start a new session")

@@ -181,7 +181,9 @@
         }
 
         async function fetchMusicKitDeveloperToken(idToken) {
-            const response = await fetch(amplifierApiBase + '/getMusicKitDeveloperToken', {
+            const url = amplifierApiBase + '/getMusicKitDeveloperToken?sessionId=' +
+                encodeURIComponent(sessionId);
+            const response = await fetch(url, {
                 method: 'GET',
                 headers: {
                     'Authorization': 'Bearer ' + idToken
