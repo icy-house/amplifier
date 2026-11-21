@@ -60,47 +60,54 @@ sequenceDiagram
 
 - Node.js 24 (Cloud Functions 2nd gen runtime; keep local Node aligned)
 - Firebase CLI
-- Apple Developer Account with Music API access
-- Firebase project with Authentication enabled
+- Apple Developer Account (Sign in with Apple **and** MusicKit / Media Services)
+- Firebase project with Authentication enabled (production: `amplemusic-prod`)
 
 ## Setup
 
-### 1. Apple Developer Setup
+Apple uses **two different keys**. Do not reuse one for the other.
 
-1. Create Apple Music API key in [Apple Developer Console](https://developer.apple.com/account/)
-2. Download the `.p8` private key file
-3. Note your Key ID, Team ID, and Issuer ID
+| Purpose | Example Key ID | Stored where |
+|---------|----------------|--------------|
+| **Sign in with Apple** (Firebase Auth on `auth.html`) | `RU5TXX2DP2` | Firebase Auth → Apple provider (Team ID, Key ID, `.p8`) |
+| **MusicKit** developer JWT | `U2RCA774DG` | Secret Manager `APPLE_MUSIC_PRIVATE_KEY` + deploy params |
 
-### 2. Firebase Configuration
+### 1. Apple Developer
+
+1. Create a **Media Services** key for MusicKit; download its `.p8` once; note Key ID and Team ID.
+2. Create (or reuse) a key with **Sign in with Apple** enabled for Firebase Auth; keep that `.p8` separate.
+3. Services ID (web SIWA), e.g. `house.icy.amplemusic.service`, with:
+   - Domains: `ample.icy.house` (and optionally `amplemusic-prod.firebaseapp.com`)
+   - Return URLs: `https://ample.icy.house/__/auth/handler` (authDomain must match the page origin for redirect SIWA)
+
+More detail: `PRODUCTION_SETUP.md`.
+
+### 2. Firebase project
 
 ```bash
-# Create Firebase project
 firebase login
-firebase projects:create amplifier-backend
-
-# Initialize functions
-cd Amplifier
-firebase use amplifier-backend
-firebase init functions
+firebase use amplemusic-prod   # see .firebaserc
 ```
 
-### 3. Environment Setup
+Enable **Authentication → Sign-in method → Apple** with the SIWA Services ID, Team ID, Key ID, and SIWA `.p8` (not the MusicKit key).
+
+### 3. MusicKit environment (Functions)
 
 Params and secrets replace the old `functions.config()` / `.runtimeconfig.json` flow.
 
 ```bash
-# Non-secret params (written to .env.<projectId> on first deploy, or set ahead of time)
-cat >> .env.amplifier-backend <<'EOF'
-APPLE_MUSIC_KEY_ID=YOUR_KEY_ID
+# Non-secret MusicKit params (gitignored .env.<projectId>)
+cat >> .env.amplemusic-prod <<'EOF'
+APPLE_MUSIC_KEY_ID=YOUR_MUSICKIT_KEY_ID
 APPLE_MUSIC_TEAM_ID=YOUR_TEAM_ID
-APPLE_MUSIC_ISSUER=YOUR_ISSUER_ID
+APPLE_MUSIC_ISSUER=YOUR_TEAM_ID
 EOF
 
-# Private key in Secret Manager (paste .p8 contents when prompted)
-firebase functions:secrets:set APPLE_MUSIC_PRIVATE_KEY
+# MusicKit private key in Secret Manager (not the SIWA key)
+firebase functions:secrets:set APPLE_MUSIC_PRIVATE_KEY --project amplemusic-prod
 ```
 
-For the emulator, put the same non-secret params in `.env` / `.env.local`, and the private key in `.secret.local` as `APPLE_MUSIC_PRIVATE_KEY=...` (never commit these files).
+For the emulator, put the same non-secret params in `.env` / `.env.local`, and the MusicKit private key in `.secret.local` as `APPLE_MUSIC_PRIVATE_KEY=...` (never commit these files).
 
 ### 4. Deploy
 
