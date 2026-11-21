@@ -1,25 +1,60 @@
-# Amplifier - Cross-Device Apple Music Authentication
+# Amplifier
 
-A Firebase Functions backend that enables cross-device authentication for the AmpleMusic Android automotive app using Apple Music APIs.
+Amplifier is the helper service for **AmpleMusic**, the Apple Music app in the car.
+
+Logging into Apple Music on a car screen is awkward, so the car shows a QR code. You scan it on your phone, sign in there, and Amplifier passes the login back to the car so the car can play your music.
 
 ## Overview
 
-Amplifier provides a secure cross-device authentication flow where users can authenticate with Apple Music on their phone/computer and have that authentication transferred to their car's AmpleMusic app. The backend generates Apple Music developer tokens and manages authentication sessions between devices.
+Amplifier is a Firebase backend (Cloud Functions, Hosting, Firestore, Auth) that runs that cross-device login flow for the AmpleMusic Android automotive app.
 
 **Key Features:**
-- Cross-device authentication flow via QR codes
-- Apple Music developer token generation
-- Firebase Authentication integration
-- Session management with automatic cleanup
+- Cross-device authentication via QR codes
+- Apple Music / MusicKit token handoff to the car
+- Firebase Authentication (Sign in with Apple on the phone)
+- Short-lived session management with cleanup
 - Rate limiting and security controls
 
 ## How It Works
 
-1. **Car App**: Displays QR code with session ID
-2. **User**: Scans QR code on phone/computer
-3. **Web Page**: User signs in with Apple via Firebase Auth
-4. **Backend**: Generates Apple Music tokens and stores session
-5. **Car App**: Polls for session completion and receives tokens
+1. **Car app**: Creates a session, keeps a poll secret, shows a QR code (`sessionId` only)
+2. **User**: Scans the QR code on a phone or computer
+3. **Web page**: User signs in with Apple (Firebase Auth) and authorizes Apple Music (MusicKit)
+4. **Backend**: Stores the completed session and short-lived tokens for the car
+5. **Car app**: Polls with `sessionId` + poll secret until success, then receives tokens once
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor User
+  participant Car as AmpleMusic<br/>(car)
+  participant Amp as Amplifier<br/>(Firebase)
+  participant Apple as Apple<br/>(SIWA + MusicKit)
+
+  Car->>Amp: Create session
+  Amp-->>Car: sessionId + pollSecret
+  Note over Car: QR shows sessionId only<br/>pollSecret stays on car
+
+  User->>Car: Scan QR with phone
+  User->>Amp: Open auth.html?sessionId=…
+  User->>Apple: Sign in with Apple
+  Apple-->>Amp: Firebase identity (via Firebase Auth)
+  User->>Apple: MusicKit authorize
+  Apple-->>Amp: Music user token
+  Amp->>Amp: Store tokens on session<br/>(short-lived developer JWT + user token)
+
+  loop Until success or expiry
+    Car->>Amp: Poll with sessionId + pollSecret
+    Amp-->>Car: pending / success + tokens (once)
+  end
+
+  Car->>Apple: Play music with tokens
+```
+
+**Who does what**
+- **AmpleMusic (car)** — starts the session, shows the QR, keeps the poll secret, then uses the tokens to talk to Apple Music.
+- **Amplifier** — brokers the handoff: session, phone auth page, short-lived tokens, one-time delivery to the car.
+- **Apple** — Sign in with Apple (who you are) and MusicKit (permission to use Apple Music). Those are two different steps.
 
 ## Prerequisites
 
@@ -141,11 +176,13 @@ while (true) {
 
 ## Security Features
 
-- **Firebase Authentication**: All requests require valid Firebase tokens
-- **Rate Limiting**: Prevents abuse with configurable limits
-- **Session Expiration**: Sessions auto-expire after 5 minutes
-- **CORS Protection**: Proper cross-origin request handling
-- **Automatic Cleanup**: Expired sessions are cleaned up every 5 minutes
+Target model (see open GitHub issues for gaps still being closed):
+
+- Firebase Authentication on the phone auth path
+- Authenticated car polling and single-use token handoff
+- Short-lived sessions with automatic cleanup
+- Secrets in Secret Manager (not the repo)
+- Rate limiting and locked-down CORS / auth hosting
 
 ## Project Structure
 
@@ -157,6 +194,9 @@ Amplifier/
 ├── public/
 │   ├── auth.html            # Cross-device auth web page
 │   └── auth-success.html    # Success confirmation page
+├── .cursor/
+│   ├── rules/               # Persistent agent rules for this repo
+│   └── skills/              # Project skill for developing Amplifier
 ├── firebase.json            # Firebase configuration
 └── package.json             # Dependencies
 ```

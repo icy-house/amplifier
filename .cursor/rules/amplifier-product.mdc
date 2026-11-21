@@ -1,0 +1,24 @@
+---
+description: What Amplifier is for and non-negotiable product/stack decisions
+alwaysApply: true
+---
+
+# Amplifier product
+
+Amplifier is the helper service for **AmpleMusic**, the Apple Music app in the car.
+
+Logging into Apple Music on a car screen is awkward, so the car shows a QR code. You scan it on your phone, sign in there, and Amplifier passes the login back to the car so the car can play your music.
+
+## Stack decisions (do not reopen unless asked)
+
+- Stay on **Firebase** (Functions, Hosting, Firestore, Auth). Do not migrate to raw GCP/Cloud Run or rewrite in Rust unless the user explicitly asks.
+- Companion Android app repo: `icy-house/ample-music`. Backend work and issues belong in **this** repo (`icy-house/amplifier`).
+- Prefer fixing security and completing MusicKit auth over new features or rewrites.
+
+## Product vocabulary
+
+- **Car / AmpleMusic**: automotive client that shows the QR and polls for tokens
+- **Phone / auth page**: `public/auth.html` where the user signs in
+- **Sign in with Apple (Firebase Auth)**: identity — not the same as Apple Music access
+- **MusicKit user token**: user Apple Music authorization the car needs
+- **Developer token**: MusicKit JWT from the `.p8` key — short-lived when issued for handoff; never treat it as the user token

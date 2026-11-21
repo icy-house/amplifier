@@ -1,0 +1,14 @@
+---
+description: TypeScript and Firebase Functions conventions for Amplifier
+globs: "**/*.{ts,js,json}"
+alwaysApply: false
+---
+
+# TypeScript / Functions
+
+- Runtime and deps must stay on a **supported** Firebase Node version; keep `package.json` `engines.node` and `firebase.json` runtime aligned.
+- Prefer Firebase **secrets/params** over deprecated `functions.config()` and env-file private keys in production.
+- MusicKit developer JWT: `iss` = Team ID, `iat`/`exp`, ES256 + `kid`. Do **not** use App Store Connect `aud: appstoreconnect-v1`.
+- Keep HTTP handlers small; share auth, validation, and rate-limit helpers.
+- Fail closed on missing config; return generic 5xx messages to clients; log details server-side only.
+- Tests: call the unit under test `fixture`; never use underscores in test method names.

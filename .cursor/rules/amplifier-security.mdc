@@ -1,0 +1,23 @@
+---
+description: Security invariants for Amplifier auth and tokens
+alwaysApply: true
+---
+
+# Amplifier security
+
+Treat this service as high-risk: it brokers Apple Music credentials.
+
+## Non-negotiables
+
+- Never commit secrets (`.p8`, keystore passwords, API keys, tokens). Keep them out of README/docs too.
+- Do not expose long-lived Apple Music **developer** JWTs via unauthenticated APIs or leave them readable in Firestore for clients.
+- Sign in with Apple ≠ MusicKit authorize. Completing auth must produce a real **MusicKit user token** (plus a short-lived developer token only if the car needs it).
+- Session polling must require a **car-held secret** (not just `sessionId` from the QR). Prefer server-generated session IDs and **single-use** token retrieval.
+- Firestore `auth_sessions`: deny client SDK access; Admin SDK only.
+- Prefer `Authorization` headers over putting ID tokens in JSON bodies.
+- Restrict CORS to known Amplifier hosting origins; harden `auth.html` (no `innerHTML` with untrusted strings; CSP / framing protections).
+- Rate limits must work across Cloud Functions instances (not process-local `Map` alone).
+
+## When changing auth
+
+Re-read open P0 issues on `icy-house/amplifier` and preserve or improve the threat model. Do not weaken poll auth, token lifetime, or client Firestore rules for convenience.
