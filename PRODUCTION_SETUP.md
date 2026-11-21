@@ -1,5 +1,16 @@
 # Production Setup for AmpleMusic
 
+Hosting: https://ample.icy.house (custom domain on Firebase Hosting site `amplemusic-prod`; also `https://amplemusic-prod.web.app`)
+
+### Custom domain DNS (`icy.house` at Squarespace)
+
+| Type | Host | Value |
+|------|------|-------|
+| CNAME | `ample` | `amplemusic-prod.web.app` |
+| TXT | `_acme-challenge.ample` | (value from Firebase Hosting cert verification; rotates) |
+
+Auth authorized domains should include `ample.icy.house`. SIWA return URL can stay on `*.firebaseapp.com`.
+
 ## Certificate Hashes for Firebase Console
 
 ### Debug Certificate (Development)
@@ -85,7 +96,7 @@
    adb install automotive/build/outputs/apk/release/automotive-release.apk
    ```
 
-3. **Test Apple Sign-In** with production certificate
+3. **Test** phone QR flow against `https://ample.icy.house/auth.html`
 
 ## Troubleshooting
 

@@ -112,6 +112,8 @@ npm run deploy
 
 Runtime is **Node.js 24** (`engines.node` and `firebase.json` `runtime: nodejs24`). Functions are **2nd gen**.
 
+Phone auth page: https://ample.icy.house/auth.html (also `amplemusic-prod.web.app`)
+
 ## API Endpoints
 
 ### POST /initializeSession
@@ -164,7 +166,7 @@ Health check endpoint.
 ```kotlin
 // 1. Generate session ID and display QR code
 val sessionId = UUID.randomUUID().toString()
-val qrUrl = "https://amplifier-backend.web.app/auth.html?sessionId=$sessionId"
+val qrUrl = "https://ample.icy.house/auth.html?sessionId=$sessionId"
 
 // 2. Initialize session
 val response = apiClient.initializeSession(sessionId, firebaseToken)
