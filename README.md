@@ -160,7 +160,7 @@ Phone completes authentication and stores short-lived tokens for the car. Tokens
 ```
 
 ### GET /getSessionStatus?sessionId=xxx
-Car polls session status. Requires `X-Poll-Secret`. On success, tokens are returned **once** and then redacted.
+Car polls session status. Requires `X-Poll-Secret`. On success, tokens are returned to the car; a short redelivery window covers lost responses, then token fields are redacted.
 
 **Headers:** `X-Poll-Secret: <pollSecret>`
 
@@ -169,7 +169,7 @@ Car polls session status. Requires `X-Poll-Secret`. On success, tokens are retur
 {
   "success": true,
   "status": "success|pending|error|consumed",
-  "userAccessToken": "token-only-on-first-success-poll"
+  "userAccessToken": "present during first handoff + short redelivery window"
 }
 ```
 
@@ -187,15 +187,19 @@ val pollSecret = created.pollSecret // keep on car only
 // 2. Show QR with sessionId only
 val qrUrl = "https://ample.icy.house/auth.html?sessionId=$sessionId"
 
-// 3. Poll with poll secret until tokens arrive once
+// 3. Poll with poll secret until tokens arrive (retry-safe briefly)
 while (true) {
     val status = apiClient.getSessionStatus(sessionId, pollSecret)
-    if (status.status == "success") {
-        val appleMusicToken = status.userAccessToken
-        // Use token for Apple Music API calls
-        break
+    when (status.status) {
+        "success" -> {
+            val appleMusicToken = status.userAccessToken
+                ?: error("success without token; start a new session")
+            // Use token for Apple Music API calls
+            break
+        }
+        "consumed", "error" -> error("Session ended; show a new QR")
+        else -> delay(2000) // pending
     }
-    delay(2000) // Poll every 2 seconds
 }
 ```
 

@@ -16,6 +16,8 @@ if (!admin.apps.length) {
 
 const AUTH_SESSIONS = 'auth_sessions';
 const SESSION_TTL_MS = 5 * 60 * 1000;
+/** Allow the car to retry a successful poll briefly if the first response was lost. */
+const TOKEN_REDELIVERY_WINDOW_MS = 2 * 60 * 1000;
 const POLL_SECRET_HEADER = 'x-poll-secret';
 
 // Rate limiting store (in production, use Redis or similar)
@@ -35,6 +37,8 @@ interface AuthSession {
   createdAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   expiresAt?: Date | FirebaseFirestore.Timestamp;
   completedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+  /** First successful poll that returned tokens; used for short idempotent redelivery. */
+  tokensDeliveredAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   tokensConsumedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
 }
 
@@ -126,17 +130,32 @@ function getPollSecret(request: {
   return secret.length > 0 ? secret : null;
 }
 
+function toMillis(
+  value: Date | FirebaseFirestore.Timestamp | admin.firestore.FieldValue | undefined
+): number | null {
+  if (!value) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof (value as FirebaseFirestore.Timestamp).toDate === 'function') {
+    return (value as FirebaseFirestore.Timestamp).toDate().getTime();
+  }
+  return null;
+}
+
 function isExpired(expiresAt: AuthSession['expiresAt']): boolean {
-  if (!expiresAt) {
+  const millis = toMillis(expiresAt);
+  return millis !== null && millis < Date.now();
+}
+
+function isWithinRedeliveryWindow(tokensDeliveredAt: AuthSession['tokensDeliveredAt']): boolean {
+  const deliveredAt = toMillis(tokensDeliveredAt);
+  if (deliveredAt === null) {
     return false;
   }
-  if (expiresAt instanceof Date) {
-    return expiresAt.getTime() < Date.now();
-  }
-  if (typeof (expiresAt as FirebaseFirestore.Timestamp).toDate === 'function') {
-    return (expiresAt as FirebaseFirestore.Timestamp).toDate().getTime() < Date.now();
-  }
-  return false;
+  return Date.now() - deliveredAt <= TOKEN_REDELIVERY_WINDOW_MS;
 }
 
 async function verifyFirebaseToken(
@@ -463,7 +482,9 @@ export const completeAuthentication = onRequest(
 );
 
 /**
- * Car polls session status. Requires pollSecret; tokens returned at most once.
+ * Car polls session status. Requires pollSecret.
+ * Tokens are delivered only to holders of pollSecret, with a short idempotent
+ * redelivery window, then redacted (single logical handoff).
  */
 export const getSessionStatus = onRequest(async (request, response) => {
   try {
@@ -534,13 +555,26 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Invalid poll secret'), { code: 401 });
         }
 
-        if (sessionData.status === 'success' && sessionData.userAccessToken) {
-          const token = sessionData.userAccessToken;
-          tx.update(sessionRef, {
-            status: 'consumed',
-            userAccessToken: admin.firestore.FieldValue.delete(),
-            tokensConsumedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
+        if (isExpired(sessionData.expiresAt)) {
+          throw Object.assign(new Error('Session has expired'), { code: 410 });
+        }
+
+        const token = sessionData.userAccessToken;
+        const canDeliverToken =
+          typeof token === 'string' &&
+          token.length > 0 &&
+          (sessionData.status === 'success' ||
+            (sessionData.status === 'consumed' &&
+              isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)));
+
+        if (canDeliverToken && token) {
+          if (!sessionData.tokensDeliveredAt) {
+            // First successful handoff: mark delivered but keep token briefly for retries.
+            tx.update(sessionRef, {
+              status: 'consumed',
+              tokensDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
 
           return {
             success: true,
@@ -550,6 +584,19 @@ export const getSessionStatus = onRequest(async (request, response) => {
             expiresAt: sessionData.expiresAt,
             userAccessToken: token,
           };
+        }
+
+        // Past redelivery window: ensure token fields are gone.
+        if (
+          sessionData.status === 'consumed' &&
+          sessionData.userAccessToken &&
+          !isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)
+        ) {
+          tx.update(sessionRef, {
+            userAccessToken: admin.firestore.FieldValue.delete(),
+            tokensConsumedAt:
+              sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
+          });
         }
 
         return {
