@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "amplifier-backend"
+    "default": "amplemusic-prod",
+    "prod": "amplemusic-prod"
   }
 }
