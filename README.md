@@ -123,45 +123,53 @@ Phone auth page: https://ample.icy.house/auth.html (also `amplemusic-prod.web.ap
 
 ## API Endpoints
 
+### POST /createSession
+Car creates a server-issued session. Returns high-entropy `sessionId` + `pollSecret`. Put only `sessionId` in the QR; keep `pollSecret` on the car.
+
+**Response:**
+```json
+{
+  "success": true,
+  "sessionId": "server-generated-id",
+  "pollSecret": "car-held-secret"
+}
+```
+
 ### POST /initializeSession
-Creates a new authentication session for cross-device flow.
+Phone binds Sign in with Apple (Firebase Auth) to an existing session. Does not create or overwrite sessions.
+
+**Headers:** `Authorization: Bearer <firebaseIdToken>`
 
 **Request:**
 ```json
 {
-  "sessionId": "unique-session-id",
-  "firebaseIdToken": "firebase-auth-token"
+  "sessionId": "server-generated-id"
 }
 ```
 
 ### POST /completeAuthentication
-Completes authentication and generates Apple Music tokens.
+Phone completes authentication and stores short-lived tokens for the car. Tokens are not returned to the phone.
+
+**Headers:** `Authorization: Bearer <firebaseIdToken>`
 
 **Request:**
 ```json
 {
-  "sessionId": "unique-session-id",
-  "firebaseIdToken": "firebase-auth-token"
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "userAccessToken": "apple-music-developer-token"
+  "sessionId": "server-generated-id"
 }
 ```
 
 ### GET /getSessionStatus?sessionId=xxx
-Check authentication session status (used by car app).
+Car polls session status. Requires `X-Poll-Secret`. On success, tokens are returned **once** and then redacted.
+
+**Headers:** `X-Poll-Secret: <pollSecret>`
 
 **Response:**
 ```json
 {
   "success": true,
-  "status": "success|pending|error",
-  "userAccessToken": "token-if-success"
+  "status": "success|pending|error|consumed",
+  "userAccessToken": "token-only-on-first-success-poll"
 }
 ```
 
@@ -171,16 +179,17 @@ Health check endpoint.
 ## Usage in AmpleMusic App
 
 ```kotlin
-// 1. Generate session ID and display QR code
-val sessionId = UUID.randomUUID().toString()
+// 1. Create session on Amplifier (server issues IDs)
+val created = apiClient.createSession()
+val sessionId = created.sessionId
+val pollSecret = created.pollSecret // keep on car only
+
+// 2. Show QR with sessionId only
 val qrUrl = "https://ample.icy.house/auth.html?sessionId=$sessionId"
 
-// 2. Initialize session
-val response = apiClient.initializeSession(sessionId, firebaseToken)
-
-// 3. Poll for completion
+// 3. Poll with poll secret until tokens arrive once
 while (true) {
-    val status = apiClient.getSessionStatus(sessionId)
+    val status = apiClient.getSessionStatus(sessionId, pollSecret)
     if (status.status == "success") {
         val appleMusicToken = status.userAccessToken
         // Use token for Apple Music API calls
@@ -192,13 +201,13 @@ while (true) {
 
 ## Security Features
 
-Target model (see open GitHub issues for gaps still being closed):
-
+- Server-issued `sessionId` + car-held `pollSecret` (QR never includes the secret)
+- Authenticated car polling (`X-Poll-Secret`) with single-use token handoff
+- Firestore `auth_sessions`: deny-all for client SDKs (Admin SDK / Functions only)
 - Firebase Authentication on the phone auth path
-- Authenticated car polling and single-use token handoff
 - Short-lived sessions with automatic cleanup
 - Secrets in Secret Manager (not the repo)
-- Rate limiting and locked-down CORS / auth hosting
+- Rate limiting (durable abuse controls still tracked separately)
 
 ## Project Structure
 

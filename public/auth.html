@@ -190,10 +190,10 @@
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${idToken}`
                     },
                     body: JSON.stringify({
-                        sessionId: sessionId,
-                        firebaseIdToken: idToken
+                        sessionId: sessionId
                     })
                 });
 
@@ -223,10 +223,10 @@
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${idToken}`
                     },
                     body: JSON.stringify({
-                        sessionId: sessionId,
-                        firebaseIdToken: idToken
+                        sessionId: sessionId
                     })
                 });
 
