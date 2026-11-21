@@ -1,3 +1,4 @@
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { onRequest } from 'firebase-functions/v2/https';
 import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { setGlobalOptions } from 'firebase-functions/v2/options';
@@ -13,8 +14,33 @@ if (!admin.apps.length) {
   admin.initializeApp();
 }
 
+const AUTH_SESSIONS = 'auth_sessions';
+const SESSION_TTL_MS = 5 * 60 * 1000;
+/** Allow the car to retry a successful poll briefly if the first response was lost. */
+const TOKEN_REDELIVERY_WINDOW_MS = 2 * 60 * 1000;
+const POLL_SECRET_HEADER = 'x-poll-secret';
+
 // Rate limiting store (in production, use Redis or similar)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+type SessionStatus = 'pending' | 'success' | 'error' | 'consumed';
+
+interface AuthSession {
+  sessionId: string;
+  pollSecretHash: string;
+  status: SessionStatus;
+  firebaseUserId?: string;
+  userEmail?: string | null;
+  authProvider?: string;
+  userAccessToken?: string;
+  error?: string;
+  createdAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+  expiresAt?: Date | FirebaseFirestore.Timestamp;
+  completedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+  /** First successful poll that returned tokens; used for short idempotent redelivery. */
+  tokensDeliveredAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+  tokensConsumedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+}
 
 function checkRateLimit(
   identifier: string,
@@ -37,21 +63,107 @@ function checkRateLimit(
   return true;
 }
 
+function setCors(
+  response: { set: (k: string, v: string) => void },
+  methods: string,
+  extraHeaders: string[] = []
+): void {
+  const allowHeaders = ['Content-Type', 'Authorization', POLL_SECRET_HEADER, ...extraHeaders];
+  response.set('Access-Control-Allow-Origin', '*');
+  response.set('Access-Control-Allow-Methods', methods);
+  response.set('Access-Control-Allow-Headers', allowHeaders.join(', '));
+}
+
+function generateHighEntropyId(byteLength: number = 32): string {
+  return randomBytes(byteLength).toString('base64url');
+}
+
+function hashPollSecret(secret: string): string {
+  return createHash('sha256').update(secret, 'utf8').digest('hex');
+}
+
+function verifyPollSecret(secret: string, expectedHash: string): boolean {
+  const actual = Buffer.from(hashPollSecret(secret), 'utf8');
+  const expected = Buffer.from(expectedHash, 'utf8');
+  if (actual.length !== expected.length) {
+    return false;
+  }
+  return timingSafeEqual(actual, expected);
+}
+
+function clientIp(request: { ip?: string }): string {
+  // Prefer the platform-resolved IP; do not trust client-supplied X-Forwarded-For.
+  return request.ip || 'unknown';
+}
+
+function getBearerToken(authHeader: string | undefined): string | null {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = authHeader.slice('Bearer '.length).trim();
+  return token.length > 0 ? token : null;
+}
+
+function getFirebaseIdToken(request: {
+  get: (name: string) => string | undefined;
+  body?: { firebaseIdToken?: string };
+}): string | null {
+  const fromHeader = getBearerToken(request.get('Authorization'));
+  if (fromHeader) {
+    return fromHeader;
+  }
+  const fromBody = request.body?.firebaseIdToken;
+  return typeof fromBody === 'string' && fromBody.length > 0 ? fromBody : null;
+}
+
+function getPollSecret(request: {
+  get: (name: string) => string | undefined;
+}): string | null {
+  const header = request.get(POLL_SECRET_HEADER);
+  if (!header) {
+    return null;
+  }
+  const secret = header.trim();
+  return secret.length > 0 ? secret : null;
+}
+
+function toMillis(
+  value: Date | FirebaseFirestore.Timestamp | admin.firestore.FieldValue | undefined
+): number | null {
+  if (!value) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof (value as FirebaseFirestore.Timestamp).toDate === 'function') {
+    return (value as FirebaseFirestore.Timestamp).toDate().getTime();
+  }
+  return null;
+}
+
+function isExpired(expiresAt: AuthSession['expiresAt']): boolean {
+  const millis = toMillis(expiresAt);
+  return millis !== null && millis < Date.now();
+}
+
+function isWithinRedeliveryWindow(tokensDeliveredAt: AuthSession['tokensDeliveredAt']): boolean {
+  const deliveredAt = toMillis(tokensDeliveredAt);
+  if (deliveredAt === null) {
+    return false;
+  }
+  return Date.now() - deliveredAt <= TOKEN_REDELIVERY_WINDOW_MS;
+}
+
 async function verifyFirebaseToken(
-  authHeader: string
+  idToken: string
 ): Promise<{
   authenticated: boolean;
   user?: admin.auth.DecodedIdToken;
   error?: string;
 }> {
   try {
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return { authenticated: false, error: 'No valid authentication token provided' };
-    }
-
-    const token = authHeader.split('Bearer ')[1];
-    const decodedToken = await admin.auth().verifyIdToken(token);
-
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
     return { authenticated: true, user: decodedToken };
   } catch (error) {
     console.error('Firebase authentication error:', error);
@@ -59,11 +171,13 @@ async function verifyFirebaseToken(
   }
 }
 
-export const initializeSession = onRequest(async (request, response) => {
+/**
+ * Car creates a session. Returns server-generated sessionId + pollSecret.
+ * QR must encode sessionId only; pollSecret stays on the car.
+ */
+export const createSession = onRequest(async (request, response) => {
   try {
-    response.set('Access-Control-Allow-Origin', '*');
-    response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    response.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    setCors(response, 'POST, OPTIONS');
 
     if (request.method === 'OPTIONS') {
       response.status(204).send('');
@@ -78,12 +192,75 @@ export const initializeSession = onRequest(async (request, response) => {
       return;
     }
 
-    const { sessionId, firebaseIdToken } = request.body;
+    const ip = clientIp(request);
+    if (!checkRateLimit(`create_session_${ip}`, 20, 60000)) {
+      response.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded. Please try again later.',
+      });
+      return;
+    }
+
+    const sessionId = generateHighEntropyId(32);
+    const pollSecret = generateHighEntropyId(32);
+    const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
+
+    const sessionData: AuthSession = {
+      sessionId,
+      pollSecretHash: hashPollSecret(pollSecret),
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+    };
+
+    await sessionRef.create(sessionData);
+
+    console.log(`Session created: ${sessionId}`);
+
+    response.status(200).json({
+      success: true,
+      sessionId,
+      pollSecret,
+      expiresAt: sessionData.expiresAt,
+    });
+  } catch (error) {
+    console.error('Error in createSession:', error);
+    response.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+});
+
+/**
+ * Phone binds Sign in with Apple identity to an existing server-created session.
+ * Does not create or overwrite sessions; sessionId must already exist.
+ */
+export const initializeSession = onRequest(async (request, response) => {
+  try {
+    setCors(response, 'POST, OPTIONS');
+
+    if (request.method === 'OPTIONS') {
+      response.status(204).send('');
+      return;
+    }
+
+    if (request.method !== 'POST') {
+      response.status(405).json({
+        success: false,
+        error: 'Method not allowed',
+      });
+      return;
+    }
+
+    const sessionId =
+      typeof request.body?.sessionId === 'string' ? request.body.sessionId.trim() : '';
+    const firebaseIdToken = getFirebaseIdToken(request);
 
     if (!sessionId || !firebaseIdToken) {
       response.status(400).json({
         success: false,
-        error: 'Missing sessionId or firebaseIdToken',
+        error: 'Missing sessionId or firebase authentication',
       });
       return;
     }
@@ -96,8 +273,8 @@ export const initializeSession = onRequest(async (request, response) => {
       return;
     }
 
-    const authResult = await verifyFirebaseToken(`Bearer ${firebaseIdToken}`);
-    if (!authResult.authenticated) {
+    const authResult = await verifyFirebaseToken(firebaseIdToken);
+    if (!authResult.authenticated || !authResult.user) {
       response.status(401).json({
         success: false,
         error: authResult.error || 'Authentication failed',
@@ -105,26 +282,59 @@ export const initializeSession = onRequest(async (request, response) => {
       return;
     }
 
-    const user = authResult.user!;
+    const user = authResult.user;
+    const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
-    const sessionRef = admin.firestore().collection('auth_sessions').doc(sessionId);
-    const sessionData = {
-      sessionId: sessionId,
-      firebaseUserId: user.uid,
-      userEmail: user.email,
-      status: 'pending',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-      authProvider: user.firebase?.sign_in_provider || 'unknown',
-    };
+    try {
+      await admin.firestore().runTransaction(async (tx) => {
+        const sessionDoc = await tx.get(sessionRef);
+        if (!sessionDoc.exists) {
+          throw Object.assign(new Error('Session not found'), { code: 404 });
+        }
 
-    await sessionRef.set(sessionData);
+        const sessionData = sessionDoc.data() as AuthSession;
+
+        if (isExpired(sessionData.expiresAt)) {
+          throw Object.assign(new Error('Session has expired'), { code: 410 });
+        }
+
+        if (sessionData.status !== 'pending') {
+          throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
+        }
+
+        if (sessionData.firebaseUserId && sessionData.firebaseUserId !== user.uid) {
+          throw Object.assign(new Error('Session does not belong to this user'), {
+            code: 403,
+          });
+        }
+
+        if (sessionData.firebaseUserId === user.uid) {
+          return;
+        }
+
+        tx.update(sessionRef, {
+          firebaseUserId: user.uid,
+          userEmail: user.email ?? null,
+          authProvider: user.firebase?.sign_in_provider || 'unknown',
+        });
+      });
+    } catch (error) {
+      const code = (error as { code?: number }).code;
+      if (typeof code === 'number') {
+        response.status(code).json({
+          success: false,
+          error: error instanceof Error ? error.message : 'Request failed',
+        });
+        return;
+      }
+      throw error;
+    }
 
     console.log(`Session initialized for user: ${user.uid}, session: ${sessionId}`);
 
     response.status(200).json({
       success: true,
-      sessionId: sessionId,
+      sessionId,
       message: 'Session initialized successfully',
     });
   } catch (error) {
@@ -140,9 +350,7 @@ export const completeAuthentication = onRequest(
   { secrets: [appleMusicPrivateKey] },
   async (request, response) => {
     try {
-      response.set('Access-Control-Allow-Origin', '*');
-      response.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      response.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      setCors(response, 'POST, OPTIONS');
 
       if (request.method === 'OPTIONS') {
         response.status(204).send('');
@@ -157,12 +365,14 @@ export const completeAuthentication = onRequest(
         return;
       }
 
-      const { sessionId, firebaseIdToken } = request.body;
+      const sessionId =
+        typeof request.body?.sessionId === 'string' ? request.body.sessionId.trim() : '';
+      const firebaseIdToken = getFirebaseIdToken(request);
 
       if (!sessionId || !firebaseIdToken) {
         response.status(400).json({
           success: false,
-          error: 'Missing sessionId or firebaseIdToken',
+          error: 'Missing sessionId or firebase authentication',
         });
         return;
       }
@@ -175,8 +385,8 @@ export const completeAuthentication = onRequest(
         return;
       }
 
-      const authResult = await verifyFirebaseToken(`Bearer ${firebaseIdToken}`);
-      if (!authResult.authenticated) {
+      const authResult = await verifyFirebaseToken(firebaseIdToken);
+      if (!authResult.authenticated || !authResult.user) {
         response.status(401).json({
           success: false,
           error: authResult.error || 'Authentication failed',
@@ -184,71 +394,85 @@ export const completeAuthentication = onRequest(
         return;
       }
 
-      const user = authResult.user!;
+      const user = authResult.user;
+      const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
-      const sessionRef = admin.firestore().collection('auth_sessions').doc(sessionId);
-      const sessionDoc = await sessionRef.get();
+      // Short-lived developer JWT for handoff only; real MusicKit user token is issue #4.
+      const userAccessToken = generateDeveloperToken(15 * 60);
 
-      if (!sessionDoc.exists) {
-        response.status(404).json({
-          success: false,
-          error: 'Session not found',
+      try {
+        await admin.firestore().runTransaction(async (tx) => {
+          const sessionDoc = await tx.get(sessionRef);
+          if (!sessionDoc.exists) {
+            throw Object.assign(new Error('Session not found'), { code: 404 });
+          }
+
+          const sessionData = sessionDoc.data() as AuthSession;
+
+          if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== user.uid) {
+            throw Object.assign(new Error('Session does not belong to this user'), {
+              code: 403,
+            });
+          }
+
+          if (isExpired(sessionData.expiresAt)) {
+            throw Object.assign(new Error('Session has expired'), { code: 410 });
+          }
+
+          if (sessionData.status !== 'pending') {
+            throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
+          }
+
+          tx.update(sessionRef, {
+            status: 'success',
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            userAccessToken,
+            // Keep tokens available briefly for the car poll, then cleanup job removes them.
+            expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+          });
         });
-        return;
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
       }
-
-      const sessionData = sessionDoc.data()!;
-
-      if (sessionData.firebaseUserId !== user.uid) {
-        response.status(403).json({
-          success: false,
-          error: 'Session does not belong to this user',
-        });
-        return;
-      }
-
-      if (sessionData.expiresAt && new Date(sessionData.expiresAt.toDate()) < new Date()) {
-        response.status(410).json({
-          success: false,
-          error: 'Session has expired',
-        });
-        return;
-      }
-
-      const developerToken = generateDeveloperToken();
-
-      // For now, we'll use the developer token as the user access token
-      // In a real implementation, you'd use the developer token to generate a user-specific token
-      const userAccessToken = developerToken;
-
-      const updateData = {
-        status: 'success',
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        userAccessToken: userAccessToken,
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      };
-
-      await sessionRef.update(updateData);
 
       console.log(`Authentication completed for user: ${user.uid}, session: ${sessionId}`);
 
+      // Tokens are delivered only to the car via authenticated poll (single-use).
       response.status(200).json({
         success: true,
-        sessionId: sessionId,
+        sessionId,
         message: 'Authentication completed successfully',
-        userAccessToken: userAccessToken,
       });
     } catch (error) {
       console.error('Error in completeAuthentication:', error);
 
       const sessionId = request.body?.sessionId;
-      if (sessionId) {
+      if (typeof sessionId === 'string' && sessionId.length > 0) {
         try {
-          const sessionRef = admin.firestore().collection('auth_sessions').doc(sessionId);
-          await sessionRef.update({
-            status: 'error',
-            error: error instanceof Error ? error.message : 'Unknown error',
-            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
+          await admin.firestore().runTransaction(async (tx) => {
+            const sessionDoc = await tx.get(sessionRef);
+            if (!sessionDoc.exists) {
+              return;
+            }
+            const sessionData = sessionDoc.data() as AuthSession;
+            // Never clobber a session that already succeeded or was consumed.
+            if (sessionData.status !== 'pending') {
+              return;
+            }
+            tx.update(sessionRef, {
+              status: 'error',
+              error: error instanceof Error ? error.message : 'Unknown error',
+              completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
           });
         } catch (updateError) {
           console.error('Failed to update session with error:', updateError);
@@ -263,11 +487,14 @@ export const completeAuthentication = onRequest(
   }
 );
 
+/**
+ * Car polls session status. Requires pollSecret.
+ * Tokens are delivered only to holders of pollSecret, with a short idempotent
+ * redelivery window, then redacted (single logical handoff).
+ */
 export const getSessionStatus = onRequest(async (request, response) => {
   try {
-    response.set('Access-Control-Allow-Origin', '*');
-    response.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    response.set('Access-Control-Allow-Headers', 'Content-Type');
+    setCors(response, 'GET, OPTIONS');
 
     if (request.method === 'OPTIONS') {
       response.status(204).send('');
@@ -282,7 +509,8 @@ export const getSessionStatus = onRequest(async (request, response) => {
       return;
     }
 
-    const sessionId = request.query.sessionId as string;
+    const sessionId =
+      typeof request.query.sessionId === 'string' ? request.query.sessionId.trim() : '';
     if (!sessionId) {
       response.status(400).json({
         success: false,
@@ -291,7 +519,18 @@ export const getSessionStatus = onRequest(async (request, response) => {
       return;
     }
 
-    if (!checkRateLimit(`get_status_${sessionId}`, 10, 60000)) {
+    const pollSecret = getPollSecret(request);
+    if (!pollSecret) {
+      response.status(401).json({
+        success: false,
+        error: 'Missing poll secret',
+      });
+      return;
+    }
+
+    // Coarse IP limit before Firestore; authenticated polls are limited after secret check.
+    const ip = clientIp(request);
+    if (!checkRateLimit(`get_status_ip_${ip}`, 60, 60000)) {
       response.status(429).json({
         success: false,
         error: 'Rate limit exceeded. Please try again later.',
@@ -299,28 +538,133 @@ export const getSessionStatus = onRequest(async (request, response) => {
       return;
     }
 
-    const sessionRef = admin.firestore().collection('auth_sessions').doc(sessionId);
-    const sessionDoc = await sessionRef.get();
+    const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
-    if (!sessionDoc.exists) {
-      response.status(404).json({
+    // Authenticate poll before counting against the car's session budget.
+    // Unknown session and wrong secret both return 401 (no existence oracle).
+    const precheck = await sessionRef.get();
+    if (!precheck.exists) {
+      response.status(401).json({
         success: false,
-        error: 'Session not found',
+        error: 'Invalid poll credentials',
       });
       return;
     }
 
-    const sessionData = sessionDoc.data()!;
+    const precheckData = precheck.data() as AuthSession;
+    if (!verifyPollSecret(pollSecret, precheckData.pollSecretHash)) {
+      response.status(401).json({
+        success: false,
+        error: 'Invalid poll credentials',
+      });
+      return;
+    }
 
-    response.status(200).json({
-      success: true,
-      sessionId: sessionData.sessionId,
-      status: sessionData.status,
-      createdAt: sessionData.createdAt,
-      expiresAt: sessionData.expiresAt,
-      userAccessToken: sessionData.status === 'success' ? sessionData.userAccessToken : undefined,
-      error: sessionData.error,
-    });
+    if (!checkRateLimit(`get_status_${sessionId}`, 30, 60000)) {
+      response.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded. Please try again later.',
+      });
+      return;
+    }
+
+    let responseBody: {
+      success: boolean;
+      sessionId: string;
+      status: SessionStatus;
+      createdAt?: AuthSession['createdAt'];
+      expiresAt?: AuthSession['expiresAt'];
+      userAccessToken?: string;
+      error?: string;
+    };
+
+    try {
+      responseBody = await admin.firestore().runTransaction(async (tx) => {
+        const sessionDoc = await tx.get(sessionRef);
+        if (!sessionDoc.exists) {
+          throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
+        }
+
+        const sessionData = sessionDoc.data() as AuthSession;
+
+        if (!verifyPollSecret(pollSecret, sessionData.pollSecretHash)) {
+          throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
+        }
+
+        if (isExpired(sessionData.expiresAt)) {
+          if (sessionData.userAccessToken) {
+            tx.update(sessionRef, {
+              userAccessToken: admin.firestore.FieldValue.delete(),
+              tokensConsumedAt:
+                sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
+              status: sessionData.status === 'pending' ? 'error' : 'consumed',
+            });
+          }
+          throw Object.assign(new Error('Session has expired'), { code: 410 });
+        }
+
+        const token = sessionData.userAccessToken;
+        const canDeliverToken =
+          typeof token === 'string' &&
+          token.length > 0 &&
+          (sessionData.status === 'success' ||
+            (sessionData.status === 'consumed' &&
+              isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)));
+
+        if (canDeliverToken && token) {
+          if (!sessionData.tokensDeliveredAt) {
+            // First successful handoff: mark delivered but keep token briefly for retries.
+            tx.update(sessionRef, {
+              status: 'consumed',
+              tokensDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+
+          return {
+            success: true,
+            sessionId: sessionData.sessionId,
+            status: 'success' as SessionStatus,
+            createdAt: sessionData.createdAt,
+            expiresAt: sessionData.expiresAt,
+            userAccessToken: token,
+          };
+        }
+
+        // Past redelivery window: ensure token fields are gone.
+        if (
+          sessionData.status === 'consumed' &&
+          sessionData.userAccessToken &&
+          !isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)
+        ) {
+          tx.update(sessionRef, {
+            userAccessToken: admin.firestore.FieldValue.delete(),
+            tokensConsumedAt:
+              sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+
+        return {
+          success: true,
+          sessionId: sessionData.sessionId,
+          status: sessionData.status,
+          createdAt: sessionData.createdAt,
+          expiresAt: sessionData.expiresAt,
+          error: sessionData.error,
+        };
+      });
+    } catch (error) {
+      const code = (error as { code?: number }).code;
+      if (typeof code === 'number') {
+        response.status(code).json({
+          success: false,
+          error: error instanceof Error ? error.message : 'Request failed',
+        });
+        return;
+      }
+      throw error;
+    }
+
+    response.status(200).json(responseBody);
   } catch (error) {
     console.error('Error in getSessionStatus:', error);
     response.status(500).json({
@@ -342,10 +686,10 @@ export const health = onRequest((request, response) => {
 
 export const cleanupExpiredSessions = onSchedule('every 5 minutes', async () => {
   try {
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-    const sessionsRef = admin.firestore().collection('auth_sessions');
+    const now = new Date();
+    const sessionsRef = admin.firestore().collection(AUTH_SESSIONS);
 
-    const snapshot = await sessionsRef.where('expiresAt', '<', fiveMinutesAgo).get();
+    const snapshot = await sessionsRef.where('expiresAt', '<', now).get();
 
     const batch = admin.firestore().batch();
     snapshot.docs.forEach((doc) => {

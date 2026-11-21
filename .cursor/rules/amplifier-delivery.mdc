@@ -1,0 +1,23 @@
+---
+description: Ship hygiene — when the agent may commit, merge, and deploy without asking
+alwaysApply: true
+---
+
+# Amplifier delivery autonomy
+
+When the user asks to implement, fix, ship, or close work in this repo, follow `.cursor/skills/shipping-amplifier/SKILL.md` end-to-end. That workflow **overrides** generic “ask before commit/push/merge” habits for Amplifier.
+
+## Human review required (stop before merge)
+
+Pause and ask the user before merge/deploy when **either** is true:
+
+- **Controversial**: auth/session protocol, poll secrets, token lifetime/single-use, Firestore rules, CORS allowlist, CSP, MusicKit/SIWA semantics, public API breaks for the car client, data deletion, or anything that weakens the threat model.
+- **Cost**: `minInstances`, higher memory/CPU, new scheduled jobs, new Firebase/GCP products or APIs, paid third-party services, retention/logging changes that bill more, or infra moves (org/project/billing).
+
+Routine docs, tests, refactors, bugfixes, and security hardenings that do **not** hit the above may commit → PR → CI → merge → prod without waiting.
+
+## Ticket hygiene
+
+- One issue → one branch → one PR; PR must include `Fixes #N`.
+- After merge + prod verify, confirm the issue is closed (or close it with a short deploy note).
+- Do not leave “done” code on a branch with an open issue and no PR.

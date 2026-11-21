@@ -69,15 +69,22 @@ export class AppleMusicAuth {
     }
   }
 
-  public generateDeveloperToken(): string {
+  /**
+   * MusicKit developer JWT. Default lifetime is short for car handoff;
+   * do not issue long-lived tokens into Firestore sessions.
+   */
+  public generateDeveloperToken(expiresInSeconds: number = 15 * 60): string {
     const config = this.loadConfig();
+
+    if (!Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) {
+      throw new Error('expiresInSeconds must be a positive number');
+    }
 
     const now = Math.floor(Date.now() / 1000);
     const payload = {
       iss: config.issuer,
       iat: now,
-      exp: now + 6 * 30 * 24 * 60 * 60, // 6 months from now
-      aud: 'appstoreconnect-v1',
+      exp: now + Math.floor(expiresInSeconds),
     };
 
     const options: jwt.SignOptions = {
@@ -100,9 +107,9 @@ export class AppleMusicAuth {
 
 let authInstance: AppleMusicAuth | null = null;
 
-export function generateDeveloperToken(): string {
+export function generateDeveloperToken(expiresInSeconds?: number): string {
   if (!authInstance) {
     authInstance = new AppleMusicAuth();
   }
-  return authInstance.generateDeveloperToken();
+  return authInstance.generateDeveloperToken(expiresInSeconds);
 }

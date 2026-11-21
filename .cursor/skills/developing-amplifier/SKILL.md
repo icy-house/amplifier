@@ -43,6 +43,10 @@ Prefer this sequence unless the user picks a ticket:
 - Mentally walk: car QR → phone sign-in + MusicKit → car poll with secret → tokens once
 - Confirm no unauthenticated token download and no client Firestore access to sessions
 
+## Shipping
+
+When the user wants work taken to production (or you finish an issue), follow **`shipping-amplifier`**: local verify → Bugbot → PR → best-model review → CI → merge → `amplemusic-prod` smoke → close ticket. Pause only for controversial or cost-affecting PRs (see `amplifier-delivery` rule).
+
 ## Related issues
 
 Track work on https://github.com/icy-house/amplifier/issues — P0 security/functionality first.
