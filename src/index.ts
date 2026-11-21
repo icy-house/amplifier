@@ -21,7 +21,10 @@ if (!admin.apps.length) {
 }
 
 const AUTH_SESSIONS = 'auth_sessions';
-const SESSION_TTL_MS = 5 * 60 * 1000;
+/** QR + phone SIWA/MusicKit flow (redirect + authorize can exceed a few minutes). */
+const SESSION_PHONE_TTL_MS = 15 * 60 * 1000;
+/** After completeAuthentication, how long the car has to poll for tokens. */
+const SESSION_HANDOFF_TTL_MS = 5 * 60 * 1000;
 /** Allow the car to retry a successful poll briefly if the first response was lost. */
 const TOKEN_REDELIVERY_WINDOW_MS = 2 * 60 * 1000;
 const POLL_SECRET_HEADER = 'x-poll-secret';
@@ -208,6 +211,8 @@ async function verifyMusicUserTokenWithApple(
   developerToken: string,
   musicUserToken: string
 ): Promise<{ valid: boolean; error?: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
   try {
     const response = await fetch('https://api.music.apple.com/v1/me/storefront', {
       method: 'GET',
@@ -215,6 +220,7 @@ async function verifyMusicUserTokenWithApple(
         Authorization: `Bearer ${developerToken}`,
         'Music-User-Token': musicUserToken,
       },
+      signal: controller.signal,
     });
 
     if (response.ok) {
@@ -228,6 +234,8 @@ async function verifyMusicUserTokenWithApple(
   } catch (error) {
     console.error('Apple Music Music User Token probe error:', error);
     return { valid: false, error: 'Unable to verify Apple Music user token' };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -270,7 +278,7 @@ export const createSession = onRequest(async (request, response) => {
       pollSecretHash: hashPollSecret(pollSecret),
       status: 'pending',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+      expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
     };
 
     await sessionRef.create(sessionData);
@@ -369,6 +377,10 @@ export const initializeSession = onRequest(async (request, response) => {
         }
 
         if (sessionData.firebaseUserId === user.uid) {
+          // Refresh phone-flow TTL so SIWA redirect + MusicKit authorize still fit.
+          tx.update(sessionRef, {
+            expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
+          });
           return;
         }
 
@@ -376,6 +388,7 @@ export const initializeSession = onRequest(async (request, response) => {
           firebaseUserId: user.uid,
           userEmail: user.email ?? null,
           authProvider: user.firebase?.sign_in_provider || 'unknown',
+          expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
         });
       });
     } catch (error) {
@@ -586,7 +599,7 @@ export const completeAuthentication = onRequest(
             musicUserToken,
             developerToken,
             // Keep tokens available briefly for the car poll, then cleanup job removes them.
-            expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+            expiresAt: new Date(Date.now() + SESSION_HANDOFF_TTL_MS),
           });
         });
       } catch (error) {
@@ -611,32 +624,8 @@ export const completeAuthentication = onRequest(
       });
     } catch (error) {
       console.error('Error in completeAuthentication:', error);
-
-      const sessionId = request.body?.sessionId;
-      if (typeof sessionId === 'string' && sessionId.length > 0) {
-        try {
-          const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
-          await admin.firestore().runTransaction(async (tx) => {
-            const sessionDoc = await tx.get(sessionRef);
-            if (!sessionDoc.exists) {
-              return;
-            }
-            const sessionData = sessionDoc.data() as AuthSession;
-            // Never clobber a session that already succeeded or was consumed.
-            if (sessionData.status !== 'pending') {
-              return;
-            }
-            tx.update(sessionRef, {
-              status: 'error',
-              error: error instanceof Error ? error.message : 'Unknown error',
-              completedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-          });
-        } catch (updateError) {
-          console.error('Failed to update session with error:', updateError);
-        }
-      }
-
+      // Leave pending sessions pending so the phone can retry after a transient failure
+      // (user may already have completed MusicKit authorize on-device).
       response.status(500).json({
         success: false,
         error: 'Internal server error',
