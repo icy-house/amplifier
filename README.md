@@ -100,7 +100,6 @@ Params and secrets replace the old `functions.config()` / `.runtimeconfig.json` 
 cat >> .env.amplemusic-prod <<'EOF'
 APPLE_MUSIC_KEY_ID=YOUR_MUSICKIT_KEY_ID
 APPLE_MUSIC_TEAM_ID=YOUR_TEAM_ID
-APPLE_MUSIC_ISSUER=YOUR_TEAM_ID
 EOF
 
 # MusicKit private key in Secret Manager (not the SIWA key)
@@ -147,20 +146,35 @@ Phone binds Sign in with Apple (Firebase Auth) to an existing session. Does not 
 }
 ```
 
+### GET|POST /getMusicKitDeveloperToken
+Phone (after Sign in with Apple) fetches a short-lived MusicKit developer JWT for MusicKit JS `configure()` / `authorize()`. JWT includes a web `origin` claim for Amplifier hosting origins. Not returned to the car.
+
+**Headers:** `Authorization: Bearer <firebaseIdToken>`
+
+**Response:**
+```json
+{
+  "success": true,
+  "developerToken": "short-lived-jwt",
+  "expiresInSeconds": 3600
+}
+```
+
 ### POST /completeAuthentication
-Phone completes authentication and stores short-lived tokens for the car. Tokens are not returned to the phone.
+Phone completes authentication after MusicKit `authorize()` and stores the Music User Token plus a fresh short-lived developer JWT for the car. Tokens are not returned to the phone.
 
 **Headers:** `Authorization: Bearer <firebaseIdToken>`
 
 **Request:**
 ```json
 {
-  "sessionId": "server-generated-id"
+  "sessionId": "server-generated-id",
+  "musicUserToken": "musickit-user-token-from-authorize"
 }
 ```
 
 ### GET /getSessionStatus?sessionId=xxx
-Car polls session status. Requires `X-Poll-Secret`. On success, tokens are returned to the car; a short redelivery window covers lost responses, then token fields are redacted.
+Car polls session status. Requires `X-Poll-Secret`. On success, the token pair is returned; a short redelivery window covers lost responses, then token fields are redacted.
 
 **Headers:** `X-Poll-Secret: <pollSecret>`
 
@@ -169,9 +183,13 @@ Car polls session status. Requires `X-Poll-Secret`. On success, tokens are retur
 {
   "success": true,
   "status": "success|pending|error|consumed",
-  "userAccessToken": "present during first handoff + short redelivery window"
+  "musicUserToken": "present during first handoff + short redelivery window",
+  "developerToken": "short-lived MusicKit developer JWT (24h) for Apple Music API Authorization header",
+  "userAccessToken": "deprecated alias of musicUserToken"
 }
 ```
+
+Apple Music user-scoped API calls need both headers: `Authorization: Bearer <developerToken>` and `Music-User-Token: <musicUserToken>`.
 
 ### GET /health
 Health check endpoint.
@@ -192,9 +210,12 @@ while (true) {
     val status = apiClient.getSessionStatus(sessionId, pollSecret)
     when (status.status) {
         "success" -> {
-            val appleMusicToken = status.userAccessToken
-                ?: error("success without token; start a new session")
-            // Use token for Apple Music API calls
+            val musicUserToken = status.musicUserToken
+                ?: status.userAccessToken // transitional alias
+                ?: error("success without music user token; start a new session")
+            val developerToken = status.developerToken
+                ?: error("success without developer token; start a new session")
+            // Call Apple Music with Authorization + Music-User-Token
             break
         }
         "consumed", "error" -> error("Session ended; show a new QR")
@@ -209,7 +230,8 @@ while (true) {
 - Authenticated car polling (`X-Poll-Secret`) with single-use token handoff (+ short redelivery window)
 - Firestore `auth_sessions`: deny-all for client SDKs (Admin SDK / Functions only)
 - Firebase Authentication on the phone auth path
-- Short-lived sessions and short-lived handoff developer JWTs (real MusicKit user token tracked separately)
+- MusicKit user token from a real phone `authorize()` step; developer JWTs are short-lived (1h web / 24h car handoff) and never long-lived 6-month tokens in the session channel
+- Web developer JWTs include an `origin` claim limited to Amplifier hosting origins
 - Secrets in Secret Manager (not the repo)
 - Rate limiting (durable abuse controls still tracked separately)
 

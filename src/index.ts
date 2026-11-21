@@ -3,7 +3,13 @@ import { onRequest } from 'firebase-functions/v2/https';
 import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { setGlobalOptions } from 'firebase-functions/v2/options';
 import * as admin from 'firebase-admin';
-import { appleMusicPrivateKey, generateDeveloperToken } from './apple-music-auth';
+import {
+  appleMusicPrivateKey,
+  generateDeveloperToken,
+  HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
+  WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+  WEB_MUSIC_ORIGINS,
+} from './apple-music-auth';
 
 setGlobalOptions({
   region: 'us-central1',
@@ -19,6 +25,8 @@ const SESSION_TTL_MS = 5 * 60 * 1000;
 /** Allow the car to retry a successful poll briefly if the first response was lost. */
 const TOKEN_REDELIVERY_WINDOW_MS = 2 * 60 * 1000;
 const POLL_SECRET_HEADER = 'x-poll-secret';
+/** MusicKit Music User Tokens are opaque; reject absurdly large bodies. */
+const MAX_MUSIC_USER_TOKEN_LENGTH = 8192;
 
 // Rate limiting store (in production, use Redis or similar)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
@@ -32,7 +40,10 @@ interface AuthSession {
   firebaseUserId?: string;
   userEmail?: string | null;
   authProvider?: string;
-  userAccessToken?: string;
+  /** MusicKit Music User Token from phone authorize(). */
+  musicUserToken?: string;
+  /** Short-lived MusicKit developer JWT for the car (no web origin claim). */
+  developerToken?: string;
   error?: string;
   createdAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   expiresAt?: Date | FirebaseFirestore.Timestamp;
@@ -40,6 +51,25 @@ interface AuthSession {
   /** First successful poll that returned tokens; used for short idempotent redelivery. */
   tokensDeliveredAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   tokensConsumedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+}
+
+function sessionHasHandoffTokens(session: AuthSession): boolean {
+  return (
+    typeof session.musicUserToken === 'string' &&
+    session.musicUserToken.length > 0 &&
+    typeof session.developerToken === 'string' &&
+    session.developerToken.length > 0
+  );
+}
+
+function tokenFieldDeletes(): {
+  musicUserToken: FirebaseFirestore.FieldValue;
+  developerToken: FirebaseFirestore.FieldValue;
+} {
+  return {
+    musicUserToken: admin.firestore.FieldValue.delete(),
+    developerToken: admin.firestore.FieldValue.delete(),
+  };
 }
 
 function checkRateLimit(
@@ -346,6 +376,80 @@ export const initializeSession = onRequest(async (request, response) => {
   }
 });
 
+/**
+ * Phone fetches a short-lived MusicKit developer JWT (with web origin claim)
+ * so MusicKit JS can call authorize(). Not for car handoff.
+ */
+export const getMusicKitDeveloperToken = onRequest(
+  { secrets: [appleMusicPrivateKey] },
+  async (request, response) => {
+    try {
+      setCors(response, 'GET, POST, OPTIONS');
+      response.set('Cache-Control', 'no-store');
+
+      if (request.method === 'OPTIONS') {
+        response.status(204).send('');
+        return;
+      }
+
+      if (request.method !== 'GET' && request.method !== 'POST') {
+        response.status(405).json({
+          success: false,
+          error: 'Method not allowed',
+        });
+        return;
+      }
+
+      const firebaseIdToken = getFirebaseIdToken(request);
+      if (!firebaseIdToken) {
+        response.status(401).json({
+          success: false,
+          error: 'Missing firebase authentication',
+        });
+        return;
+      }
+
+      const authResult = await verifyFirebaseToken(firebaseIdToken);
+      if (!authResult.authenticated || !authResult.user) {
+        response.status(401).json({
+          success: false,
+          error: authResult.error || 'Authentication failed',
+        });
+        return;
+      }
+
+      if (!checkRateLimit(`musickit_dev_token_${authResult.user.uid}`, 10, 300000)) {
+        response.status(429).json({
+          success: false,
+          error: 'Rate limit exceeded. Please try again later.',
+        });
+        return;
+      }
+
+      const developerToken = generateDeveloperToken({
+        expiresInSeconds: WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+        origins: WEB_MUSIC_ORIGINS,
+      });
+
+      response.status(200).json({
+        success: true,
+        developerToken,
+        expiresInSeconds: WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+      });
+    } catch (error) {
+      console.error('Error in getMusicKitDeveloperToken:', error);
+      response.status(500).json({
+        success: false,
+        error: 'Internal server error',
+      });
+    }
+  }
+);
+
+/**
+ * Phone completes auth after MusicKit authorize(). Stores Music User Token +
+ * a fresh short-lived developer JWT for the car. Tokens are not returned here.
+ */
 export const completeAuthentication = onRequest(
   { secrets: [appleMusicPrivateKey] },
   async (request, response) => {
@@ -367,12 +471,24 @@ export const completeAuthentication = onRequest(
 
       const sessionId =
         typeof request.body?.sessionId === 'string' ? request.body.sessionId.trim() : '';
+      const musicUserToken =
+        typeof request.body?.musicUserToken === 'string'
+          ? request.body.musicUserToken.trim()
+          : '';
       const firebaseIdToken = getFirebaseIdToken(request);
 
       if (!sessionId || !firebaseIdToken) {
         response.status(400).json({
           success: false,
           error: 'Missing sessionId or firebase authentication',
+        });
+        return;
+      }
+
+      if (!musicUserToken || musicUserToken.length > MAX_MUSIC_USER_TOKEN_LENGTH) {
+        response.status(400).json({
+          success: false,
+          error: 'Missing or invalid musicUserToken',
         });
         return;
       }
@@ -397,8 +513,10 @@ export const completeAuthentication = onRequest(
       const user = authResult.user;
       const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
-      // Short-lived developer JWT for handoff only; real MusicKit user token is issue #4.
-      const userAccessToken = generateDeveloperToken(15 * 60);
+      // Fresh short-lived developer JWT for the car (no web origin claim).
+      const developerToken = generateDeveloperToken({
+        expiresInSeconds: HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
+      });
 
       try {
         await admin.firestore().runTransaction(async (tx) => {
@@ -426,7 +544,8 @@ export const completeAuthentication = onRequest(
           tx.update(sessionRef, {
             status: 'success',
             completedAt: admin.firestore.FieldValue.serverTimestamp(),
-            userAccessToken,
+            musicUserToken,
+            developerToken,
             // Keep tokens available briefly for the car poll, then cleanup job removes them.
             expiresAt: new Date(Date.now() + SESSION_TTL_MS),
           });
@@ -574,6 +693,9 @@ export const getSessionStatus = onRequest(async (request, response) => {
       status: SessionStatus;
       createdAt?: AuthSession['createdAt'];
       expiresAt?: AuthSession['expiresAt'];
+      musicUserToken?: string;
+      developerToken?: string;
+      /** @deprecated Alias of musicUserToken for older car clients. */
       userAccessToken?: string;
       error?: string;
     };
@@ -592,9 +714,9 @@ export const getSessionStatus = onRequest(async (request, response) => {
         }
 
         if (isExpired(sessionData.expiresAt)) {
-          if (sessionData.userAccessToken) {
+          if (sessionHasHandoffTokens(sessionData)) {
             tx.update(sessionRef, {
-              userAccessToken: admin.firestore.FieldValue.delete(),
+              ...tokenFieldDeletes(),
               tokensConsumedAt:
                 sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
               status: sessionData.status === 'pending' ? 'error' : 'consumed',
@@ -603,22 +725,23 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Session has expired'), { code: 410 });
         }
 
-        const token = sessionData.userAccessToken;
         const canDeliverToken =
-          typeof token === 'string' &&
-          token.length > 0 &&
+          sessionHasHandoffTokens(sessionData) &&
           (sessionData.status === 'success' ||
             (sessionData.status === 'consumed' &&
               isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)));
 
-        if (canDeliverToken && token) {
+        if (canDeliverToken) {
           if (!sessionData.tokensDeliveredAt) {
-            // First successful handoff: mark delivered but keep token briefly for retries.
+            // First successful handoff: mark delivered but keep tokens briefly for retries.
             tx.update(sessionRef, {
               status: 'consumed',
               tokensDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
             });
           }
+
+          const musicUserToken = sessionData.musicUserToken as string;
+          const developerToken = sessionData.developerToken as string;
 
           return {
             success: true,
@@ -626,18 +749,20 @@ export const getSessionStatus = onRequest(async (request, response) => {
             status: 'success' as SessionStatus,
             createdAt: sessionData.createdAt,
             expiresAt: sessionData.expiresAt,
-            userAccessToken: token,
+            musicUserToken,
+            developerToken,
+            userAccessToken: musicUserToken,
           };
         }
 
         // Past redelivery window: ensure token fields are gone.
         if (
           sessionData.status === 'consumed' &&
-          sessionData.userAccessToken &&
+          sessionHasHandoffTokens(sessionData) &&
           !isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)
         ) {
           tx.update(sessionRef, {
-            userAccessToken: admin.firestore.FieldValue.delete(),
+            ...tokenFieldDeletes(),
             tokensConsumedAt:
               sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
           });
