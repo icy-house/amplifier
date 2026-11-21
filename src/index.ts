@@ -91,11 +91,8 @@ function verifyPollSecret(secret: string, expectedHash: string): boolean {
   return timingSafeEqual(actual, expected);
 }
 
-function clientIp(request: { ip?: string; headers: Record<string, unknown> }): string {
-  const forwarded = request.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length > 0) {
-    return forwarded.split(',')[0].trim();
-  }
+function clientIp(request: { ip?: string }): string {
+  // Prefer the platform-resolved IP; do not trust client-supplied X-Forwarded-For.
   return request.ip || 'unknown';
 }
 
@@ -399,54 +396,52 @@ export const completeAuthentication = onRequest(
 
       const user = authResult.user;
       const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
-      const sessionDoc = await sessionRef.get();
 
-      if (!sessionDoc.exists) {
-        response.status(404).json({
-          success: false,
-          error: 'Session not found',
+      // Short-lived developer JWT for handoff only; real MusicKit user token is issue #4.
+      const userAccessToken = generateDeveloperToken(15 * 60);
+
+      try {
+        await admin.firestore().runTransaction(async (tx) => {
+          const sessionDoc = await tx.get(sessionRef);
+          if (!sessionDoc.exists) {
+            throw Object.assign(new Error('Session not found'), { code: 404 });
+          }
+
+          const sessionData = sessionDoc.data() as AuthSession;
+
+          if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== user.uid) {
+            throw Object.assign(new Error('Session does not belong to this user'), {
+              code: 403,
+            });
+          }
+
+          if (isExpired(sessionData.expiresAt)) {
+            throw Object.assign(new Error('Session has expired'), { code: 410 });
+          }
+
+          if (sessionData.status !== 'pending') {
+            throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
+          }
+
+          tx.update(sessionRef, {
+            status: 'success',
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            userAccessToken,
+            // Keep tokens available briefly for the car poll, then cleanup job removes them.
+            expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+          });
         });
-        return;
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
       }
-
-      const sessionData = sessionDoc.data() as AuthSession;
-
-      if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== user.uid) {
-        response.status(403).json({
-          success: false,
-          error: 'Session does not belong to this user',
-        });
-        return;
-      }
-
-      if (isExpired(sessionData.expiresAt)) {
-        response.status(410).json({
-          success: false,
-          error: 'Session has expired',
-        });
-        return;
-      }
-
-      if (sessionData.status !== 'pending') {
-        response.status(409).json({
-          success: false,
-          error: 'Session is no longer pending',
-        });
-        return;
-      }
-
-      const developerToken = generateDeveloperToken();
-
-      // Placeholder until MusicKit user-token flow lands (issue #4).
-      const userAccessToken = developerToken;
-
-      await sessionRef.update({
-        status: 'success',
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        userAccessToken,
-        // Keep tokens available briefly for the car poll, then cleanup job removes them.
-        expiresAt: new Date(Date.now() + SESSION_TTL_MS),
-      });
 
       console.log(`Authentication completed for user: ${user.uid}, session: ${sessionId}`);
 
@@ -463,10 +458,21 @@ export const completeAuthentication = onRequest(
       if (typeof sessionId === 'string' && sessionId.length > 0) {
         try {
           const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
-          await sessionRef.update({
-            status: 'error',
-            error: error instanceof Error ? error.message : 'Unknown error',
-            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          await admin.firestore().runTransaction(async (tx) => {
+            const sessionDoc = await tx.get(sessionRef);
+            if (!sessionDoc.exists) {
+              return;
+            }
+            const sessionData = sessionDoc.data() as AuthSession;
+            // Never clobber a session that already succeeded or was consumed.
+            if (sessionData.status !== 'pending') {
+              return;
+            }
+            tx.update(sessionRef, {
+              status: 'error',
+              error: error instanceof Error ? error.message : 'Unknown error',
+              completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
           });
         } catch (updateError) {
           console.error('Failed to update session with error:', updateError);
@@ -522,7 +528,9 @@ export const getSessionStatus = onRequest(async (request, response) => {
       return;
     }
 
-    if (!checkRateLimit(`get_status_${sessionId}`, 30, 60000)) {
+    // Coarse IP limit before Firestore; authenticated polls are limited after secret check.
+    const ip = clientIp(request);
+    if (!checkRateLimit(`get_status_ip_${ip}`, 60, 60000)) {
       response.status(429).json({
         success: false,
         error: 'Rate limit exceeded. Please try again later.',
@@ -531,6 +539,34 @@ export const getSessionStatus = onRequest(async (request, response) => {
     }
 
     const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
+
+    // Authenticate poll before counting against the car's session budget.
+    // Unknown session and wrong secret both return 401 (no existence oracle).
+    const precheck = await sessionRef.get();
+    if (!precheck.exists) {
+      response.status(401).json({
+        success: false,
+        error: 'Invalid poll credentials',
+      });
+      return;
+    }
+
+    const precheckData = precheck.data() as AuthSession;
+    if (!verifyPollSecret(pollSecret, precheckData.pollSecretHash)) {
+      response.status(401).json({
+        success: false,
+        error: 'Invalid poll credentials',
+      });
+      return;
+    }
+
+    if (!checkRateLimit(`get_status_${sessionId}`, 30, 60000)) {
+      response.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded. Please try again later.',
+      });
+      return;
+    }
 
     let responseBody: {
       success: boolean;
@@ -546,16 +582,24 @@ export const getSessionStatus = onRequest(async (request, response) => {
       responseBody = await admin.firestore().runTransaction(async (tx) => {
         const sessionDoc = await tx.get(sessionRef);
         if (!sessionDoc.exists) {
-          throw Object.assign(new Error('Session not found'), { code: 404 });
+          throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
         }
 
         const sessionData = sessionDoc.data() as AuthSession;
 
         if (!verifyPollSecret(pollSecret, sessionData.pollSecretHash)) {
-          throw Object.assign(new Error('Invalid poll secret'), { code: 401 });
+          throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
         }
 
         if (isExpired(sessionData.expiresAt)) {
+          if (sessionData.userAccessToken) {
+            tx.update(sessionRef, {
+              userAccessToken: admin.firestore.FieldValue.delete(),
+              tokensConsumedAt:
+                sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
+              status: sessionData.status === 'pending' ? 'error' : 'consumed',
+            });
+          }
           throw Object.assign(new Error('Session has expired'), { code: 410 });
         }
 

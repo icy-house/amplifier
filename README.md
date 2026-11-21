@@ -206,10 +206,10 @@ while (true) {
 ## Security Features
 
 - Server-issued `sessionId` + car-held `pollSecret` (QR never includes the secret)
-- Authenticated car polling (`X-Poll-Secret`) with single-use token handoff
+- Authenticated car polling (`X-Poll-Secret`) with single-use token handoff (+ short redelivery window)
 - Firestore `auth_sessions`: deny-all for client SDKs (Admin SDK / Functions only)
 - Firebase Authentication on the phone auth path
-- Short-lived sessions with automatic cleanup
+- Short-lived sessions and short-lived handoff developer JWTs (real MusicKit user token tracked separately)
 - Secrets in Secret Manager (not the repo)
 - Rate limiting (durable abuse controls still tracked separately)
 
