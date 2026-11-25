@@ -624,16 +624,19 @@ export const completeAuthentication = onRequest(
       const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
       // Ownership check before calling Apple (avoids using this endpoint as a MUT oracle).
-      const precheck = await sessionRef.get();
-      if (!precheck.exists) {
-        response.status(404).json({
-          success: false,
-          error: 'Session not found',
-        });
-        return;
-      }
+      // Also extend expiry so the ~10s Apple probe cannot race the phone-flow TTL.
       try {
-        assertPhoneBoundPendingSession(precheck.data() as AuthSession, user.uid);
+        await admin.firestore().runTransaction(async (tx) => {
+          const sessionDoc = await tx.get(sessionRef);
+          if (!sessionDoc.exists) {
+            throw Object.assign(new Error('Session not found'), { code: 404 });
+          }
+          const sessionData = sessionDoc.data() as AuthSession;
+          assertPhoneBoundPendingSession(sessionData, user.uid);
+          tx.update(sessionRef, {
+            expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
+          });
+        });
       } catch (error) {
         const code = (error as { code?: number }).code;
         if (typeof code === 'number') {
@@ -815,12 +818,24 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
         }
 
+        const hasDeliveredAt = toMillis(sessionData.tokensDeliveredAt) !== null;
         const withinRedeliveryWindow =
           sessionData.status === 'consumed' &&
+          hasDeliveredAt &&
           isWithinRedeliveryWindow(sessionData.tokensDeliveredAt);
+        // Consumed with tokens but missing tokensDeliveredAt (partial write): allow
+        // one more handoff rather than deleting immediately.
+        const recoverableConsumedHandoff =
+          sessionData.status === 'consumed' &&
+          sessionHasHandoffTokens(sessionData) &&
+          !hasDeliveredAt;
 
         // Expiry must not clobber an active redelivery window (lost first poll response).
-        if (isExpired(sessionData.expiresAt) && !withinRedeliveryWindow) {
+        if (
+          isExpired(sessionData.expiresAt) &&
+          !withinRedeliveryWindow &&
+          !recoverableConsumedHandoff
+        ) {
           if (sessionHasHandoffTokens(sessionData)) {
             tx.update(sessionRef, {
               ...tokenFieldDeletes(),
@@ -834,10 +849,12 @@ export const getSessionStatus = onRequest(async (request, response) => {
 
         const canDeliverToken =
           sessionHasHandoffTokens(sessionData) &&
-          (sessionData.status === 'success' || withinRedeliveryWindow);
+          (sessionData.status === 'success' ||
+            withinRedeliveryWindow ||
+            recoverableConsumedHandoff);
 
         if (canDeliverToken) {
-          if (!sessionData.tokensDeliveredAt) {
+          if (!hasDeliveredAt) {
             // First successful handoff: mark delivered, extend TTL through the retry window.
             tx.update(sessionRef, {
               status: 'consumed',
@@ -864,6 +881,7 @@ export const getSessionStatus = onRequest(async (request, response) => {
         if (
           sessionData.status === 'consumed' &&
           sessionHasHandoffTokens(sessionData) &&
+          hasDeliveredAt &&
           !withinRedeliveryWindow
         ) {
           tx.update(sessionRef, {

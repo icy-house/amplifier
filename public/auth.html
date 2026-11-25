@@ -197,15 +197,13 @@
         }
 
         async function ensureMusicKitConfigured() {
+            const MusicKitApi = await waitForMusicKit();
             if (musicKitConfigured) {
-                return MusicKit.getInstance();
+                return MusicKitApi.getInstance();
             }
             updateStatus('Preparing Apple Music…', 'pending', true);
             const idToken = await currentUser.getIdToken();
-            const [MusicKitApi, developerToken] = await Promise.all([
-                waitForMusicKit(),
-                fetchMusicKitDeveloperToken(idToken)
-            ]);
+            const developerToken = await fetchMusicKitDeveloperToken(idToken);
             await MusicKitApi.configure({
                 developerToken: developerToken,
                 app: {
@@ -262,10 +260,19 @@
 
                 updateStatus('Authorize Apple Music in the dialog…', 'pending', true);
                 const authorizeResult = await music.authorize();
-                const musicUserToken =
-                    (typeof authorizeResult === 'string' && authorizeResult.trim())
-                        ? authorizeResult.trim()
-                        : (typeof music.musicUserToken === 'string' ? music.musicUserToken.trim() : '');
+                // Prefer the instance MUT after a successful authorize(); MusicKit may
+                // resolve authorize() with a non-token string (e.g. status text).
+                let musicUserToken = '';
+                if (typeof music.musicUserToken === 'string' && music.musicUserToken.trim()) {
+                    musicUserToken = music.musicUserToken.trim();
+                } else if (
+                    typeof authorizeResult === 'string' &&
+                    authorizeResult.trim() &&
+                    authorizeResult.trim().length >= 32 &&
+                    !/\s/.test(authorizeResult.trim())
+                ) {
+                    musicUserToken = authorizeResult.trim();
+                }
                 if (!musicUserToken) {
                     throw new Error('Apple Music authorization did not return a user token');
                 }
