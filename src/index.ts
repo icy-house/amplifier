@@ -3,7 +3,13 @@ import { onRequest } from 'firebase-functions/v2/https';
 import { onSchedule } from 'firebase-functions/v2/scheduler';
 import { setGlobalOptions } from 'firebase-functions/v2/options';
 import * as admin from 'firebase-admin';
-import { appleMusicPrivateKey, generateDeveloperToken } from './apple-music-auth';
+import {
+  appleMusicPrivateKey,
+  generateDeveloperToken,
+  HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
+  WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+  WEB_MUSIC_ORIGINS,
+} from './apple-music-auth';
 
 setGlobalOptions({
   region: 'us-central1',
@@ -15,10 +21,15 @@ if (!admin.apps.length) {
 }
 
 const AUTH_SESSIONS = 'auth_sessions';
-const SESSION_TTL_MS = 5 * 60 * 1000;
+/** QR + phone SIWA/MusicKit flow (redirect + authorize can exceed a few minutes). */
+const SESSION_PHONE_TTL_MS = 15 * 60 * 1000;
+/** After completeAuthentication, how long the car has to poll for tokens. */
+const SESSION_HANDOFF_TTL_MS = 5 * 60 * 1000;
 /** Allow the car to retry a successful poll briefly if the first response was lost. */
 const TOKEN_REDELIVERY_WINDOW_MS = 2 * 60 * 1000;
 const POLL_SECRET_HEADER = 'x-poll-secret';
+/** MusicKit Music User Tokens are opaque; reject absurdly large bodies. */
+const MAX_MUSIC_USER_TOKEN_LENGTH = 8192;
 
 // Rate limiting store (in production, use Redis or similar)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
@@ -32,7 +43,10 @@ interface AuthSession {
   firebaseUserId?: string;
   userEmail?: string | null;
   authProvider?: string;
-  userAccessToken?: string;
+  /** MusicKit Music User Token from phone authorize(). */
+  musicUserToken?: string;
+  /** Short-lived MusicKit developer JWT for the car (no web origin claim). */
+  developerToken?: string;
   error?: string;
   createdAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   expiresAt?: Date | FirebaseFirestore.Timestamp;
@@ -40,6 +54,25 @@ interface AuthSession {
   /** First successful poll that returned tokens; used for short idempotent redelivery. */
   tokensDeliveredAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
   tokensConsumedAt?: FirebaseFirestore.Timestamp | admin.firestore.FieldValue;
+}
+
+function sessionHasHandoffTokens(session: AuthSession): boolean {
+  return (
+    typeof session.musicUserToken === 'string' &&
+    session.musicUserToken.length > 0 &&
+    typeof session.developerToken === 'string' &&
+    session.developerToken.length > 0
+  );
+}
+
+function tokenFieldDeletes(): {
+  musicUserToken: FirebaseFirestore.FieldValue;
+  developerToken: FirebaseFirestore.FieldValue;
+} {
+  return {
+    musicUserToken: admin.firestore.FieldValue.delete(),
+    developerToken: admin.firestore.FieldValue.delete(),
+  };
 }
 
 function checkRateLimit(
@@ -155,6 +188,28 @@ function isWithinRedeliveryWindow(tokensDeliveredAt: AuthSession['tokensDelivere
   return Date.now() - deliveredAt <= TOKEN_REDELIVERY_WINDOW_MS;
 }
 
+/** Phone-flow expiry capped by session creation so re-init cannot extend forever. */
+function phoneFlowExpiresAt(createdAt: AuthSession['createdAt']): Date {
+  const createdMs = toMillis(createdAt) ?? Date.now();
+  const absoluteMax = createdMs + SESSION_PHONE_TTL_MS;
+  return new Date(Math.min(Date.now() + SESSION_PHONE_TTL_MS, absoluteMax));
+}
+
+function assertPhoneBoundPendingSession(
+  sessionData: AuthSession,
+  uid: string
+): void {
+  if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== uid) {
+    throw Object.assign(new Error('Session does not belong to this user'), { code: 403 });
+  }
+  if (isExpired(sessionData.expiresAt)) {
+    throw Object.assign(new Error('Session has expired'), { code: 410 });
+  }
+  if (sessionData.status !== 'pending') {
+    throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
+  }
+}
+
 async function verifyFirebaseToken(
   idToken: string
 ): Promise<{
@@ -168,6 +223,52 @@ async function verifyFirebaseToken(
   } catch (error) {
     console.error('Firebase authentication error:', error);
     return { authenticated: false, error: 'Invalid authentication token' };
+  }
+}
+
+/**
+ * Prove the Music User Token works with Apple Music before storing it for the car.
+ */
+async function verifyMusicUserTokenWithApple(
+  developerToken: string,
+  musicUserToken: string
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch('https://api.music.apple.com/v1/me/storefront', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${developerToken}`,
+        'Music-User-Token': musicUserToken,
+      },
+      signal: controller.signal,
+    });
+
+    if (response.ok) {
+      return { ok: true };
+    }
+
+    console.error(
+      `Apple Music Music User Token probe failed: HTTP ${response.status}`
+    );
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, status: 400, error: 'Invalid Apple Music user token' };
+    }
+    return {
+      ok: false,
+      status: 502,
+      error: 'Apple Music verification temporarily unavailable',
+    };
+  } catch (error) {
+    console.error('Apple Music Music User Token probe error:', error);
+    return {
+      ok: false,
+      status: 502,
+      error: 'Unable to verify Apple Music user token',
+    };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -210,7 +311,7 @@ export const createSession = onRequest(async (request, response) => {
       pollSecretHash: hashPollSecret(pollSecret),
       status: 'pending',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+      expiresAt: new Date(Date.now() + SESSION_PHONE_TTL_MS),
     };
 
     await sessionRef.create(sessionData);
@@ -309,6 +410,9 @@ export const initializeSession = onRequest(async (request, response) => {
         }
 
         if (sessionData.firebaseUserId === user.uid) {
+          tx.update(sessionRef, {
+            expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
+          });
           return;
         }
 
@@ -316,6 +420,7 @@ export const initializeSession = onRequest(async (request, response) => {
           firebaseUserId: user.uid,
           userEmail: user.email ?? null,
           authProvider: user.firebase?.sign_in_provider || 'unknown',
+          expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
         });
       });
     } catch (error) {
@@ -346,6 +451,115 @@ export const initializeSession = onRequest(async (request, response) => {
   }
 });
 
+/**
+ * Phone fetches a short-lived MusicKit developer JWT (with web origin claim)
+ * so MusicKit JS can call authorize(). Not for car handoff.
+ */
+export const getMusicKitDeveloperToken = onRequest(
+  { secrets: [appleMusicPrivateKey] },
+  async (request, response) => {
+    try {
+      setCors(response, 'GET, POST, OPTIONS');
+      response.set('Cache-Control', 'no-store');
+
+      if (request.method === 'OPTIONS') {
+        response.status(204).send('');
+        return;
+      }
+
+      if (request.method !== 'GET' && request.method !== 'POST') {
+        response.status(405).json({
+          success: false,
+          error: 'Method not allowed',
+        });
+        return;
+      }
+
+      const sessionIdRaw =
+        typeof request.query?.sessionId === 'string'
+          ? request.query.sessionId
+          : typeof request.body?.sessionId === 'string'
+            ? request.body.sessionId
+            : '';
+      const sessionId = sessionIdRaw.trim();
+      const firebaseIdToken = getFirebaseIdToken(request);
+
+      if (!sessionId || !firebaseIdToken) {
+        response.status(400).json({
+          success: false,
+          error: 'Missing sessionId or firebase authentication',
+        });
+        return;
+      }
+
+      const authResult = await verifyFirebaseToken(firebaseIdToken);
+      if (!authResult.authenticated || !authResult.user) {
+        response.status(401).json({
+          success: false,
+          error: authResult.error || 'Authentication failed',
+        });
+        return;
+      }
+
+      if (!checkRateLimit(`musickit_dev_token_${authResult.user.uid}`, 10, 300000)) {
+        response.status(429).json({
+          success: false,
+          error: 'Rate limit exceeded. Please try again later.',
+        });
+        return;
+      }
+
+      const sessionDoc = await admin
+        .firestore()
+        .collection(AUTH_SESSIONS)
+        .doc(sessionId)
+        .get();
+      if (!sessionDoc.exists) {
+        response.status(404).json({
+          success: false,
+          error: 'Session not found',
+        });
+        return;
+      }
+
+      try {
+        assertPhoneBoundPendingSession(sessionDoc.data() as AuthSession, authResult.user.uid);
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
+      }
+
+      const developerToken = generateDeveloperToken({
+        expiresInSeconds: WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+        origins: WEB_MUSIC_ORIGINS,
+      });
+
+      response.status(200).json({
+        success: true,
+        developerToken,
+        expiresInSeconds: WEB_DEVELOPER_TOKEN_TTL_SECONDS,
+      });
+    } catch (error) {
+      console.error('Error in getMusicKitDeveloperToken:', error);
+      response.status(500).json({
+        success: false,
+        error: 'Internal server error',
+      });
+    }
+  }
+);
+
+/**
+ * Phone completes auth after MusicKit authorize(). Stores Music User Token +
+ * a fresh short-lived developer JWT for the car. Tokens are not returned here.
+ */
 export const completeAuthentication = onRequest(
   { secrets: [appleMusicPrivateKey] },
   async (request, response) => {
@@ -367,12 +581,24 @@ export const completeAuthentication = onRequest(
 
       const sessionId =
         typeof request.body?.sessionId === 'string' ? request.body.sessionId.trim() : '';
+      const musicUserToken =
+        typeof request.body?.musicUserToken === 'string'
+          ? request.body.musicUserToken.trim()
+          : '';
       const firebaseIdToken = getFirebaseIdToken(request);
 
       if (!sessionId || !firebaseIdToken) {
         response.status(400).json({
           success: false,
           error: 'Missing sessionId or firebase authentication',
+        });
+        return;
+      }
+
+      if (!musicUserToken || musicUserToken.length > MAX_MUSIC_USER_TOKEN_LENGTH) {
+        response.status(400).json({
+          success: false,
+          error: 'Missing or invalid musicUserToken',
         });
         return;
       }
@@ -397,8 +623,45 @@ export const completeAuthentication = onRequest(
       const user = authResult.user;
       const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
 
-      // Short-lived developer JWT for handoff only; real MusicKit user token is issue #4.
-      const userAccessToken = generateDeveloperToken(15 * 60);
+      // Ownership check before calling Apple (avoids using this endpoint as a MUT oracle).
+      // Also extend expiry so the ~10s Apple probe cannot race the phone-flow TTL.
+      try {
+        await admin.firestore().runTransaction(async (tx) => {
+          const sessionDoc = await tx.get(sessionRef);
+          if (!sessionDoc.exists) {
+            throw Object.assign(new Error('Session not found'), { code: 404 });
+          }
+          const sessionData = sessionDoc.data() as AuthSession;
+          assertPhoneBoundPendingSession(sessionData, user.uid);
+          tx.update(sessionRef, {
+            expiresAt: phoneFlowExpiresAt(sessionData.createdAt),
+          });
+        });
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (typeof code === 'number') {
+          response.status(code).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Request failed',
+          });
+          return;
+        }
+        throw error;
+      }
+
+      // Fresh short-lived developer JWT for the car (no web origin claim).
+      const developerToken = generateDeveloperToken({
+        expiresInSeconds: HANDOFF_DEVELOPER_TOKEN_TTL_SECONDS,
+      });
+
+      const tokenProbe = await verifyMusicUserTokenWithApple(developerToken, musicUserToken);
+      if (!tokenProbe.ok) {
+        response.status(tokenProbe.status).json({
+          success: false,
+          error: tokenProbe.error,
+        });
+        return;
+      }
 
       try {
         await admin.firestore().runTransaction(async (tx) => {
@@ -407,28 +670,15 @@ export const completeAuthentication = onRequest(
             throw Object.assign(new Error('Session not found'), { code: 404 });
           }
 
-          const sessionData = sessionDoc.data() as AuthSession;
-
-          if (!sessionData.firebaseUserId || sessionData.firebaseUserId !== user.uid) {
-            throw Object.assign(new Error('Session does not belong to this user'), {
-              code: 403,
-            });
-          }
-
-          if (isExpired(sessionData.expiresAt)) {
-            throw Object.assign(new Error('Session has expired'), { code: 410 });
-          }
-
-          if (sessionData.status !== 'pending') {
-            throw Object.assign(new Error('Session is no longer pending'), { code: 409 });
-          }
+          assertPhoneBoundPendingSession(sessionDoc.data() as AuthSession, user.uid);
 
           tx.update(sessionRef, {
             status: 'success',
             completedAt: admin.firestore.FieldValue.serverTimestamp(),
-            userAccessToken,
+            musicUserToken,
+            developerToken,
             // Keep tokens available briefly for the car poll, then cleanup job removes them.
-            expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+            expiresAt: new Date(Date.now() + SESSION_HANDOFF_TTL_MS),
           });
         });
       } catch (error) {
@@ -453,32 +703,8 @@ export const completeAuthentication = onRequest(
       });
     } catch (error) {
       console.error('Error in completeAuthentication:', error);
-
-      const sessionId = request.body?.sessionId;
-      if (typeof sessionId === 'string' && sessionId.length > 0) {
-        try {
-          const sessionRef = admin.firestore().collection(AUTH_SESSIONS).doc(sessionId);
-          await admin.firestore().runTransaction(async (tx) => {
-            const sessionDoc = await tx.get(sessionRef);
-            if (!sessionDoc.exists) {
-              return;
-            }
-            const sessionData = sessionDoc.data() as AuthSession;
-            // Never clobber a session that already succeeded or was consumed.
-            if (sessionData.status !== 'pending') {
-              return;
-            }
-            tx.update(sessionRef, {
-              status: 'error',
-              error: error instanceof Error ? error.message : 'Unknown error',
-              completedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-          });
-        } catch (updateError) {
-          console.error('Failed to update session with error:', updateError);
-        }
-      }
-
+      // Leave pending sessions pending so the phone can retry after a transient failure
+      // (user may already have completed MusicKit authorize on-device).
       response.status(500).json({
         success: false,
         error: 'Internal server error',
@@ -574,7 +800,8 @@ export const getSessionStatus = onRequest(async (request, response) => {
       status: SessionStatus;
       createdAt?: AuthSession['createdAt'];
       expiresAt?: AuthSession['expiresAt'];
-      userAccessToken?: string;
+      musicUserToken?: string;
+      developerToken?: string;
       error?: string;
     };
 
@@ -591,10 +818,27 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Invalid poll credentials'), { code: 401 });
         }
 
-        if (isExpired(sessionData.expiresAt)) {
-          if (sessionData.userAccessToken) {
+        const hasDeliveredAt = toMillis(sessionData.tokensDeliveredAt) !== null;
+        const withinRedeliveryWindow =
+          sessionData.status === 'consumed' &&
+          hasDeliveredAt &&
+          isWithinRedeliveryWindow(sessionData.tokensDeliveredAt);
+        // Consumed with tokens but missing tokensDeliveredAt (partial write): allow
+        // one more handoff rather than deleting immediately.
+        const recoverableConsumedHandoff =
+          sessionData.status === 'consumed' &&
+          sessionHasHandoffTokens(sessionData) &&
+          !hasDeliveredAt;
+
+        // Expiry must not clobber an active redelivery window (lost first poll response).
+        if (
+          isExpired(sessionData.expiresAt) &&
+          !withinRedeliveryWindow &&
+          !recoverableConsumedHandoff
+        ) {
+          if (sessionHasHandoffTokens(sessionData)) {
             tx.update(sessionRef, {
-              userAccessToken: admin.firestore.FieldValue.delete(),
+              ...tokenFieldDeletes(),
               tokensConsumedAt:
                 sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
               status: sessionData.status === 'pending' ? 'error' : 'consumed',
@@ -603,22 +847,24 @@ export const getSessionStatus = onRequest(async (request, response) => {
           throw Object.assign(new Error('Session has expired'), { code: 410 });
         }
 
-        const token = sessionData.userAccessToken;
         const canDeliverToken =
-          typeof token === 'string' &&
-          token.length > 0 &&
+          sessionHasHandoffTokens(sessionData) &&
           (sessionData.status === 'success' ||
-            (sessionData.status === 'consumed' &&
-              isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)));
+            withinRedeliveryWindow ||
+            recoverableConsumedHandoff);
 
-        if (canDeliverToken && token) {
-          if (!sessionData.tokensDeliveredAt) {
-            // First successful handoff: mark delivered but keep token briefly for retries.
+        if (canDeliverToken) {
+          if (!hasDeliveredAt) {
+            // First successful handoff: mark delivered, extend TTL through the retry window.
             tx.update(sessionRef, {
               status: 'consumed',
               tokensDeliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+              expiresAt: new Date(Date.now() + TOKEN_REDELIVERY_WINDOW_MS),
             });
           }
+
+          const musicUserToken = sessionData.musicUserToken as string;
+          const developerToken = sessionData.developerToken as string;
 
           return {
             success: true,
@@ -626,18 +872,20 @@ export const getSessionStatus = onRequest(async (request, response) => {
             status: 'success' as SessionStatus,
             createdAt: sessionData.createdAt,
             expiresAt: sessionData.expiresAt,
-            userAccessToken: token,
+            musicUserToken,
+            developerToken,
           };
         }
 
         // Past redelivery window: ensure token fields are gone.
         if (
           sessionData.status === 'consumed' &&
-          sessionData.userAccessToken &&
-          !isWithinRedeliveryWindow(sessionData.tokensDeliveredAt)
+          sessionHasHandoffTokens(sessionData) &&
+          hasDeliveredAt &&
+          !withinRedeliveryWindow
         ) {
           tx.update(sessionRef, {
-            userAccessToken: admin.firestore.FieldValue.delete(),
+            ...tokenFieldDeletes(),
             tokensConsumedAt:
               sessionData.tokensConsumedAt || admin.firestore.FieldValue.serverTimestamp(),
           });
